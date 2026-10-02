@@ -41,13 +41,14 @@ jobs:
 
       - name: Prepare map and template bot
         run: |
-          PKG=$(python3 -c "import unswbc, pathlib; print(pathlib.Path(unswbc.__file__).parent)")
+          # UNSWBC_PKG is the site-packages dir CONTAINING the unswbc package
+          PKG=$(python3 -c "import unswbc, pathlib; print(pathlib.Path(unswbc.__file__).parent.parent)")
           echo "UNSWBC_PKG=$PKG" >> "$GITHUB_ENV"
           mkdir -p /tmp/bot
-          cp "$PKG/templates/cpp/"* /tmp/bot/
+          cp "$PKG/unswbc/templates/cpp/"* /tmp/bot/
           printf '[project]\nlanguage = "c++"\ninclude = ["*.cpp", "*.hpp", "*.cc", "*.hh", "*.c", "*.h"]\n' \
             > /tmp/bot/bot.toml
-          ls "$PKG/templates/maps" | head
+          ls "$PKG/unswbc/templates/maps" | head
 
       - name: Unit tests
         run: |
@@ -59,7 +60,7 @@ jobs:
         env:
           HAVE_KVM: ${{ steps.kvm.outputs.ok }}
         run: |
-          MAPS="$UNSWBC_PKG/templates/maps"
+          MAPS="$UNSWBC_PKG/unswbc/templates/maps"
           if [ "$HAVE_KVM" = "true" ]; then BE=native,kvm; else BE=native; fi
           python3 bench.py "$MAPS/arena.map" /tmp/bot /tmp/bot \
             --seeds 11 --runs 1 --backends "$BE" --sandbox --compare \
@@ -69,7 +70,7 @@ jobs:
         env:
           HAVE_KVM: ${{ steps.kvm.outputs.ok }}
         run: |
-          MAPS="$UNSWBC_PKG/templates/maps"
+          MAPS="$UNSWBC_PKG/unswbc/templates/maps"
           if [ "$HAVE_KVM" = "true" ]; then BE=native,kvm; else BE=native; fi
           python3 bench.py "$MAPS/schooltime.map" /tmp/bot /tmp/bot \
             --seeds 11 --runs 1 --backends "$BE" --compare \
@@ -90,6 +91,8 @@ jobs:
               d = json.loads(p.read_text())
               for be, ent in d["backends"].items():
                   for k, v in ent.items():
+                      if not isinstance(v, dict):
+                          continue
                       if not k.startswith("seed_"):
                           print(f"| {name} | {be}:{k} | {v.get('wall_s')} | "
                                 f"{v.get('match_s')} | {v.get('rss_mb')} | "

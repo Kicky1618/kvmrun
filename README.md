@@ -10,14 +10,26 @@ a single binary, and plays a whole match — roughly **50–100× faster** than
 - **`native`** — links the wasm2c output and the wasm-rt runtime into a normal
   Linux binary. Bots run as host pthreads.
 - **`kvm`** — links the same code into a freestanding ELF loaded into a minimal
-  KVM guest on a single vCPU (`vmm.c` is the VM). Guest threads are cooperative
-  contexts scheduled in-guest; the guest has its own tiny libc (`guest/`), a
-  demand-paged heap backed by guest-managed page tables, and per-thread
-  demand-paged stacks. Synchronisation and I/O go through hypercalls
-  (`abi.h`): an MMIO doorbell plus per-thread mailbox pages, futex wait/wake,
-  and a replay-write call.
+  VM guest on a single vCPU. Guest threads are cooperative contexts scheduled
+  in-guest; the guest has its own tiny libc (`guest/`), a demand-paged heap
+  backed by guest-managed page tables, and per-thread demand-paged stacks.
+  Synchronisation and I/O go through hypercalls (`abi.h`): an MMIO doorbell
+  plus per-thread mailbox pages, futex wait/wake, and a replay-write call.
+  The hypervisor driver is platform-native:
+  - **Linux** → `vmm.c` over `/dev/kvm`
+  - **Windows x64** → `vmm_whpx.c` over the Windows Hypervisor Platform
+    (WinHvPlatform.dll, loaded dynamically — needs the "Windows Hypervisor
+    Platform" feature or the Hyper-V role). WHPX memory exits carry no write
+    data, so the MMIO doorbell's mailbox pointer is recovered by decoding the
+    guest's store instruction; FS/GS-base MSRs are emulated in the VMM.
+  - **macOS** → not yet: Hypervisor.framework on Apple Silicon runs arm64
+    guests only, which needs an arm64 port of `guest/`.
 
-The KVM backend exists to mirror the real judge's single-CPU contention model:
+  The shared hypercall dispatch, futex parker, ELF loader, replay writer and
+  stats live in `vmm_common.h` — guest-input validation is single-sourced
+  across both drivers.
+
+The VM backend exists to mirror the real judge's single-CPU contention model:
 all bot threads share one vCPU, so CPU-point accounting and wall-clock races
 behave like the production sandbox rather than an SMP host.
 
@@ -111,7 +123,9 @@ unresolved.
   `win32/include` shims and `runner` links as `runner.exe` with no
   libwinpthread dependency (`clock_gettime` is shimmed over QPC/FileTime).
 - `clang` (clang-cl / mingw clang on Windows); on Linux also `ld`
-  (guest ELF link for the `kvm` backend)
+  (guest ELF link). On Windows the guest ELF objects are cross-compiled
+  with `-target x86_64-unknown-linux-gnu` and linked via `clang -fuse-ld=lld`
+  (llvm-mingw ships `ld.lld`)
 - [wabt](https://github.com/WebAssembly/wabt) `wasm2c`; exception support
   is required — kvmrun passes `--enable-exceptions` only when the binary
   advertises it (removed in newer wabt, where exceptions are always on)
@@ -124,8 +138,9 @@ unresolved.
 - the `unswbc` package (the judge toolchain, engine wasm, and metering pass):
   `uv tool install unswbc` — auto-detected from the `unswbc` console script's
   venv, an importable install, or `~/.local/share/uv/tools/unswbc`
-- `/dev/kvm` access for the `kvm` backend only (Linux; refused early on
-  other platforms)
+- for the `kvm` backend: usable `/dev/kvm` on Linux, or the Windows
+  Hypervisor Platform on Windows x64 (WHPX; refused early elsewhere —
+  macOS arm64 pending a guest port)
 
 ### Environment overrides
 

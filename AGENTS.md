@@ -29,6 +29,22 @@
 - `kvm` backend: single BSP vCPU, cooperative in-guest contexts
   (`guest/gthr.c`); never add real parallel vCPUs for bots — the serial
   protocol is what reproduces the judge's CPU-point contention model.
+  The VM driver is per-platform: `vmm.c` (Linux `/dev/kvm`) and
+  `vmm_whpx.c` (Windows WHPX — WinHvPlatform.dll loaded dynamically).
+  Hypercall dispatch, futex parking, ELF load, replay writer and stats
+  are single-sourced in `vmm_common.h` — do NOT duplicate that logic into
+  a driver; provide only the `hva`/`gptr`/`spawn_vcpu` hooks it declares.
+  WHPX memory exits carry no write data, so `doorbell_data` decodes the
+  guest's `mov [DOORBELL_GPA], reg` store to recover the mailbox GPA;
+  FS/GS/KernelGS-base MSRs are emulated via the segment-register file.
+  Guest RAM is VirtualAlloc-reserved then committed+WHPX-mapped in 2MiB
+  chunks on unmapped-GPA exits (explicit demand paging); `gptr` refuses
+  uncommitted ranges so a hostile guest cannot make the VMM touch
+  uncommitted VA. WHPX runtime is not yet hardware-verified — the
+  exception-bitmap is left at 0 assuming unmapped vectors are delivered
+  to the guest IDT (needed for the demand-paged stack #PF scheme).
+  macOS is gated off: Hypervisor.framework on arm64 needs an arm64 guest
+  port (entry.S, page tables, setjmp, ctx switch are all x86-specific).
 - Demand-paged guest stacks (`stk_alloc`/`stk_free` in `klibc.c`) and TLS
   inside each stack block — thousands of live threads OOM with eager stacks.
 - Physical-frame recycling (`phys_free`/`phys2m_free`,

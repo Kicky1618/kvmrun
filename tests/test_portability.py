@@ -46,4 +46,35 @@ for name in ("bota", "botb", "engine"):
     assert re.search(pat, HOST), f"{name}: weak-def stub missing/unguarded"
 print("icount accessors are #ifndef-guarded weak definitions")
 
+# ---- WHPX driver (Windows sandboxed backend) -----------------------------
+# vmm_whpx.c must share the single dispatch implementation — a second copy
+# of the hypercall switch would drift out of lockstep with the hardened
+# validation in vmm_common.h.
+WHPX = (ROOT / "vmm_whpx.c").read_text()
+VMMC = (ROOT / "vmm.c").read_text()
+COMMON = (ROOT / "vmm_common.h").read_text()
+assert '#include "vmm_common.h"' in WHPX, "vmm_whpx.c must share dispatch"
+assert '#include "vmm_common.h"' in VMMC, "vmm.c must share dispatch"
+assert "case HC_PRINT" not in WHPX and "case HC_PRINT" not in VMMC, \
+    "hypercall switch must live only in vmm_common.h"
+assert "case HC_PRINT" in COMMON, "dispatch missing from vmm_common.h"
+# both drivers provide the hooks vmm_common.h declares
+for drv, src in (("vmm.c", VMMC), ("vmm_whpx.c", WHPX)):
+    for hook in ("hva", "gptr", "spawn_vcpu"):
+        assert re.search(rf"static .*{hook}\(", src), f"{drv}: missing {hook}"
+# WHPX memory exits carry no write data: the doorbell must recover the
+# mailbox GPA by decoding the store, never assume v->mbx
+assert "doorbell_data" in WHPX, "vmm_whpx.c must decode the doorbell store"
+assert "dispatch(v, v->mbx)" not in WHPX, "doorbell must not assume v->mbx"
+# FS/GS base MSRs are emulated (no KVM_SET_MSRS equivalent under WHPX)
+assert "MSR_FS_BASE" in WHPX and "KernelGsBase" in WHPX, \
+    "vmm_whpx.c must emulate fs/gs base MSRs"
+print("vmm_whpx: shared dispatch + doorbell decode + MSR emulation")
+
+# The Windows shim must cover every pthread symbol used by BOTH drivers
+vmm_used = set(re.findall(r"pthread_[a-z_]+", VMMC + WHPX + COMMON))
+missing = vmm_used - have
+assert not missing, f"win32 shim missing for vmm: {sorted(missing)}"
+print(f"pthread shim covers vmm APIs too ({len(vmm_used - used)} extra)")
+
 print("test_portability: OK")

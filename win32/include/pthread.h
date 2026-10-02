@@ -66,63 +66,91 @@ static __inline int kvmrun_win_clock_gettime(int id, struct timespec *ts) {
     return 0;
 }
 
-/* ---- mutexes --------------------------------------------------------- */
+/* ---- mutexes ----------------------------------------------------------
+ * SRWLOCK-based so PTHREAD_MUTEX_INITIALIZER works (a zeroed
+ * CRITICAL_SECTION is not valid, SRWLOCK_INIT is). Non-recursive, same as
+ * a default pthread mutex. Condition variables pair via
+ * SleepConditionVariableSRW. */
 
-typedef CRITICAL_SECTION pthread_mutex_t;
+typedef SRWLOCK pthread_mutex_t;
 typedef void *pthread_mutexattr_t;
+#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
 
 static __inline int pthread_mutex_init(pthread_mutex_t *m,
                                        const pthread_mutexattr_t *a) {
     (void)a;
-    InitializeCriticalSection(m);
+    InitializeSRWLock(m);
     return 0;
 }
 static __inline int pthread_mutex_lock(pthread_mutex_t *m) {
-    EnterCriticalSection(m);
+    AcquireSRWLockExclusive(m);
     return 0;
 }
 static __inline int pthread_mutex_unlock(pthread_mutex_t *m) {
-    LeaveCriticalSection(m);
+    ReleaseSRWLockExclusive(m);
     return 0;
 }
 static __inline int pthread_mutex_destroy(pthread_mutex_t *m) {
-    DeleteCriticalSection(m);
+    (void)m;
     return 0;
 }
 
-/* ---- condition variables ---------------------------------------------- */
+/* ---- condition variables ----------------------------------------------
+ * pthread_cond_timedwait takes an ABSOLUTE deadline in the cond's clock
+ * (pthread_condattr_setclock; default CLOCK_REALTIME). Win32 CVs take a
+ * relative timeout — convert using the cond's clock. */
 
-typedef CONDITION_VARIABLE pthread_cond_t;
-typedef void *pthread_condattr_t;
+typedef struct {
+    CONDITION_VARIABLE cv;
+    int clock_id;
+} pthread_cond_t;
+typedef struct {
+    int clock_id;
+} pthread_condattr_t;
+
+static __inline int pthread_condattr_init(pthread_condattr_t *a) {
+    a->clock_id = CLOCK_REALTIME;
+    return 0;
+}
+static __inline int pthread_condattr_setclock(pthread_condattr_t *a, int clk) {
+    a->clock_id = clk;
+    return 0;
+}
+static __inline int pthread_condattr_destroy(pthread_condattr_t *a) {
+    (void)a;
+    return 0;
+}
 
 static __inline int pthread_cond_init(pthread_cond_t *c,
                                       const pthread_condattr_t *a) {
-    (void)a;
-    InitializeConditionVariable(c);
+    InitializeConditionVariable(&c->cv);
+    c->clock_id = a ? a->clock_id : CLOCK_REALTIME;
     return 0;
 }
 static __inline int pthread_cond_wait(pthread_cond_t *c,
                                       pthread_mutex_t *m) {
-    return SleepConditionVariableCS(c, m, INFINITE) ? 0 : EIO;
+    return SleepConditionVariableSRW(&c->cv, m, INFINITE, 0) ? 0 : EIO;
 }
-static __inline int pthread_cond_broadcast(pthread_cond_t *c) {
-    WakeAllConditionVariable(c);
+static __inline int pthread_cond_signal(pthread_cond_t *c) {
+    WakeConditionVariable(&c->cv);
     return 0;
 }
-/* pthread_cond_timedwait takes an ABSOLUTE CLOCK_REALTIME deadline;
- * SleepConditionVariableCS takes a relative timeout — convert. */
+static __inline int pthread_cond_broadcast(pthread_cond_t *c) {
+    WakeAllConditionVariable(&c->cv);
+    return 0;
+}
 static __inline int pthread_cond_timedwait(pthread_cond_t *c,
                                            pthread_mutex_t *m,
                                            const struct timespec *ab) {
     struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
+    clock_gettime(c->clock_id, &now);
     int64_t ms = (int64_t)(ab->tv_sec - now.tv_sec) * 1000 +
                  (ab->tv_nsec - now.tv_nsec) / 1000000;
     if (ms < 0)
         return ETIMEDOUT;
     if (ms > (int64_t)INFINITE - 1)
         ms = INFINITE - 1;
-    if (SleepConditionVariableCS(c, m, (DWORD)ms))
+    if (SleepConditionVariableSRW(&c->cv, m, (DWORD)ms, 0))
         return 0;
     return GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : EIO;
 }

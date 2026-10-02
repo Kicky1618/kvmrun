@@ -339,6 +339,10 @@ GUEST_CFLAGS = [
 def guest_cflags() -> list[str]:
     fl = list(GUEST_CFLAGS)
     fl[fl.index(None)] = str(clang_res_inc())
+    fl += simde_flags()
+    if IS_WINDOWS:
+        # the guest payload is freestanding x86-64 ELF regardless of host
+        fl += ["-target", "x86_64-unknown-linux-gnu"]
     return fl
 
 
@@ -428,15 +432,27 @@ def runner_key(backend: str, link_objs: list[pathlib.Path],
 
 
 def vmm_bin() -> pathlib.Path:
-    vmm = cache_dir("vmm-" + hashlib.sha256(
-        (HERE / "vmm.c").read_bytes() +
+    # the sandboxed backend: KVM on Linux, WHPX on Windows — same guest
+    # ELF and ABI either way (vmm_common.h holds the shared dispatch)
+    if IS_WINDOWS:
+        src, out = "vmm_whpx.c", "vmm.exe"
+    else:
+        src, out = "vmm.c", "vmm"
+    key = hashlib.sha256(
+        (HERE / src).read_bytes() +
+        (HERE / "vmm_common.h").read_bytes() +
         (HERE / "abi.h").read_bytes() +
-        tool_versions().encode()).hexdigest()[:16]) / "vmm"
+        tool_versions().encode())
+    if IS_WINDOWS:  # pthread shim affects the WHPX driver
+        for f in sorted((HERE / "win32" / "include").rglob("*")):
+            if f.is_file():
+                key.update(f.name.encode() + b"\0" + f.read_bytes())
+    vmm = cache_dir("vmm-" + key.hexdigest()[:16]) / out
     if not vmm.is_file():
         tmp = _tmp_for(vmm)
         try:
-            sh([CLANG, "-O2", "-pthread", "-o", str(tmp),
-                str(HERE / "vmm.c")])
+            sh([CLANG, "-O2", *native_flags(),
+                "-o", str(tmp), str(HERE / src)])
             os.replace(tmp, vmm)
         finally:
             tmp.unlink(missing_ok=True)
@@ -547,15 +563,27 @@ def build(backend: str, arg_a: str, arg_b: str):
             gsup.append(out)
         ent = work / "entry.o"
         sh([CLANG, "-c",
+            *(["-target", "x86_64-unknown-linux-gnu"] if IS_WINDOWS else []),
             *(["-DWASM_RT_ALLOW_SEGUE=1"] if host_fsgsbase() else []),
             "-o", str(ent), str(HERE / "guest" / "entry.S")])
         ghost = work / "host.guest.o"
         sh([CLANG, "-O1", "-c", *guest_cflags(), f"-I{WABT_INC}",
             f"-I{WASM_RT_DIR}", f"-I{work}", f"-I{HERE}",
             "-o", str(ghost), str(HERE / "host.c")])
-        sh(["ld", "-T", str(HERE / "guest" / "guest.ld"), "--build-id=none",
-            "-o", str(bout), str(ent), *map(str, gsup), str(ghost),
-            *map(str, gobjs), *map(str, grt)])
+        if IS_WINDOWS:
+            # mingw `ld` targets PE/COFF — drive the ELF link through
+            # clang -target instead (uses ld.lld from llvm-mingw/zig)
+            sh([CLANG, "-target", "x86_64-unknown-linux-gnu", "-nostdlib",
+                "-fuse-ld=lld",
+                "-Wl,-T," + str(HERE / "guest" / "guest.ld"),
+                "-Wl,--build-id=none",
+                "-o", str(bout), str(ent), *map(str, gsup), str(ghost),
+                *map(str, gobjs), *map(str, grt)])
+        else:
+            sh(["ld", "-T", str(HERE / "guest" / "guest.ld"),
+                "--build-id=none",
+                "-o", str(bout), str(ent), *map(str, gsup), str(ghost),
+                *map(str, gobjs), *map(str, grt)])
         os.replace(bout, binary)
         vmm = vmm_bin()
         print(f"guest built in {time.monotonic() - t0:.1f}s -> {binary}",
@@ -694,11 +722,17 @@ def main() -> int:
     if backend not in ("native", "kvm"):
         print(f"unknown backend {backend!r}", file=sys.stderr)
         return 2
-    if backend == "kvm" and not (
-            IS_LINUX and os.access("/dev/kvm", os.R_OK | os.W_OK)):
-        print("kvmrun: the kvm backend needs Linux with usable /dev/kvm; "
-              "use --backend native on this platform", file=sys.stderr)
-        return 2
+    if backend == "kvm":
+        # sandboxed VM: KVM on Linux, WHPX on Windows (same guest ABI).
+        # macOS has no x86-64 hypervisor backend yet (Hypervisor.framework
+        # on arm64 needs an arm64 guest port).
+        ok = (IS_WINDOWS or
+              (IS_LINUX and os.access("/dev/kvm", os.R_OK | os.W_OK)))
+        if not ok:
+            print("kvmrun: the kvm backend needs usable /dev/kvm (Linux) or "
+                  "WHPX (Windows); use --backend native on this platform",
+                  file=sys.stderr)
+            return 2
 
     if batch_file is not None:
         # the jobs file owns replay selection; keep -v/--debug globals

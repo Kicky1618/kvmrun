@@ -47,15 +47,23 @@
 #define NORETURN __attribute__((noreturn))
 
 // optional instruction counters, exported only when the module was built
-// with KVMRUN_ICOUNT=1 (absent symbols resolve to NULL)
+// with KVMRUN_ICOUNT=1 (absent symbols resolve to NULL stubs). #ifndef
+// guards: the same-bot shim defines w2c_botb_* as macros over bota's, and a
+// stub would re-expand to a second definition of w2c_bota_kvmrun_icount.
 #ifdef __GNUC__
 #define KVMRUN_WEAK __attribute__((weak))
 #else
 #define KVMRUN_WEAK
 #endif
+#ifndef w2c_bota_kvmrun_icount
 KVMRUN_WEAK u64 *w2c_bota_kvmrun_icount(w2c_bota *inst) { (void)inst; return 0; }
+#endif
+#ifndef w2c_botb_kvmrun_icount
 KVMRUN_WEAK u64 *w2c_botb_kvmrun_icount(w2c_botb *inst) { (void)inst; return 0; }
+#endif
+#ifndef w2c_engine_kvmrun_icount
 KVMRUN_WEAK u64 *w2c_engine_kvmrun_icount(w2c_engine *inst) { (void)inst; return 0; }
+#endif
 
 #define MAX_TURN_POINTS 100000000LL
 #define MAX_MEMORY_PAGES 768

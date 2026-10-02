@@ -27,9 +27,44 @@
 #endif
 
 /* ---- clock_gettime --------------------------------------------------
- * Every supported toolchain already provides it (UCRT >= Win10 1809 and
- * MinGW-w64 >= 8 both implement CLOCK_MONOTONIC). Kept out of this shim:
- * redefining it collides with <time.h> prototypes. */
+ * mingw keeps clock_gettime in libwinpthread — linking it adds a runtime
+ * dependency on libwinpthread-1.dll. Provide our own under a macro rename
+ * (declared in <time.h>, calls rewritten to this TU-local definition), so
+ * runner.exe stays free of the pthread DLL entirely. */
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+#define clock_gettime kvmrun_win_clock_gettime
+static __inline int kvmrun_win_clock_gettime(int id, struct timespec *ts) {
+    if (id == CLOCK_MONOTONIC) {
+        static volatile LONG qpf_done;
+        static LARGE_INTEGER qpf;
+        if (!qpf_done) {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            qpf = f;
+            InterlockedExchange(&qpf_done, 1);
+        }
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        ts->tv_sec = (time_t)(c.QuadPart / qpf.QuadPart);
+        ts->tv_nsec = (long)((c.QuadPart % qpf.QuadPart)
+                             * 1000000000LL / qpf.QuadPart);
+        return 0;
+    }
+    /* CLOCK_REALTIME and anything else: FILETIME is 100 ns ticks since
+     * 1601; the unix epoch is 11644473600 s after that. */
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime)
+                 - 116444736000000000ull;
+    ts->tv_sec = (time_t)(t / 10000000ull);
+    ts->tv_nsec = (long)(t % 10000000ull) * 100;
+    return 0;
+}
 
 /* ---- mutexes --------------------------------------------------------- */
 

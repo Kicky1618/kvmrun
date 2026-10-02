@@ -101,19 +101,25 @@ unresolved.
 
 ## Requirements
 
-- Linux (tested), macOS, or Windows, Python 3. The `native` backend
-  builds on all three; on Windows a mingw/clang-compatible toolchain is
-  required (`host.c` resolves `<pthread.h>`/`<unistd.h>` through the
-  `win32/include` shims) and `runner` links as `runner.exe`.
-  macOS/Windows are compile- and link-verified but not runtime-tested in
-  CI — report issues with `-v` output.
-- `clang` (clang-cl / mingw clang on Windows — MSVC `cl` is not
-  supported); on Linux also `ld` (guest ELF link for the `kvm` backend)
-- [wabt](https://github.com/WebAssembly/wabt) (`wasm2c` with
-  `--enable-exceptions`)
+- Linux (tested), macOS (arm64 tested — `native` produces byte-identical
+  replays vs the official sandbox), or Windows (tested on Server 2022
+  with llvm-mingw — real matches run), Python ≥ 3.11 (unswbc needs
+  `tomllib`; on older interpreters `pip install tomli` works as a shim).
+  On Windows a mingw-compatible clang is required — MSVC `cl` is not
+  supported and plain LLVM lacks libc headers; install `llvm-mingw`.
+  `host.c` resolves `<pthread.h>`/`<unistd.h>` through the
+  `win32/include` shims and `runner` links as `runner.exe` with no
+  libwinpthread dependency (`clock_gettime` is shimmed over QPC/FileTime).
+- `clang` (clang-cl / mingw clang on Windows); on Linux also `ld`
+  (guest ELF link for the `kvm` backend)
+- [wabt](https://github.com/WebAssembly/wabt) `wasm2c`; exception support
+  is required — kvmrun passes `--enable-exceptions` only when the binary
+  advertises it (removed in newer wabt, where exceptions are always on)
 - [simde](https://github.com/simd-everywhere/simde) headers — wasm2c emits
-  `<simde/wasm/simd128.h>` for SIMD-enabled modules. Needs a package that
-  ships the `wasm/` module (e.g. Arch `simde`); Debian/Ubuntu's
+  `<simde/wasm/simd128.h>` for SIMD-enabled modules. Auto-detected under
+  `/opt/homebrew/include`, `/usr/local/include`, `/opt/local/include`
+  (override with `SIMDE_INC` or `CPATH`). Needs a package that ships the
+  `wasm/` module (e.g. Arch `simde`, Homebrew `simde`); Debian/Ubuntu's
   `libsimde-dev` is too old — install from the upstream source tree.
 - the `unswbc` package (the judge toolchain, engine wasm, and metering pass):
   `uv tool install unswbc` — auto-detected from the `unswbc` console script's
@@ -127,6 +133,7 @@ unresolved.
 |---|---|
 | `UNSWBC_PKG` | site-packages dir containing the `unswbc` package |
 | `WABT_BIN` | dir containing `wasm2c` (or `WABT` = prefix with `bin/`) |
+| `SIMDE_INC` | extra include dir probed for `simde/wasm/simd128.h` (before the built-in list) |
 | `XDG_CACHE_HOME` | cache root (default `~/.cache`) |
 | `KVMRUN_OPT` | optimization level for generated objects (default `-O2`) |
 | `KVMRUN_DEPTHCOUNT` | `0` disables wasm call-depth counting |

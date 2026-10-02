@@ -31,6 +31,17 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 
+if sys.version_info < (3, 11):
+    # unswbc.project imports tomllib (3.11+); tomli is its backport
+    try:
+        import tomli
+        sys.modules.setdefault("tomllib", tomli)
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "kvmrun: needs Python >= 3.11 (unswbc uses tomllib). "
+            "Run with a newer interpreter — e.g. `uv run --python 3.12 "
+            "kvmrun.py ...` — or `pip install tomli` into this one.")
+
 
 def _unswbc_pkg() -> pathlib.Path:
     """Locate the site-packages directory containing the `unswbc` package."""
@@ -98,6 +109,42 @@ WABT_INC = WASM_RT_DIR          # generated code only needs wasm-rt headers
 CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "kvmrun"
 CLANG = os.environ.get("KVMRUN_CC", "clang")
 
+_W2C_FLAGS: list[str] | None = None
+
+
+def wasm2c_flags() -> list[str]:
+    """Feature flags this wasm2c accepts. wabt removed --enable-exceptions
+    (exceptions are always on) around 1.0.36 — pass it only if advertised."""
+    global _W2C_FLAGS
+    if _W2C_FLAGS is None:
+        try:
+            out = subprocess.run([str(WABT_BIN / "wasm2c"), "--help"],
+                                 capture_output=True, text=True)
+            _W2C_FLAGS = (["--enable-exceptions"]
+                          if "--enable-exceptions" in
+                          (out.stdout + out.stderr) else [])
+        except OSError:
+            _W2C_FLAGS = []
+    return _W2C_FLAGS
+
+
+_SIMDE_INC: str | None = None
+
+
+def simde_flags() -> list[str]:
+    """-isystem path for <simde/wasm/simd128.h> when it lives outside the
+    compiler's default search (Homebrew's /opt/homebrew, MacPorts, etc.).
+    SIMDE_INC overrides; CPATH also works since it reaches clang anyway."""
+    global _SIMDE_INC
+    if _SIMDE_INC is None:
+        _SIMDE_INC = ""
+        for c in (os.environ.get("SIMDE_INC"), "/opt/homebrew/include",
+                  "/usr/local/include", "/opt/local/include"):
+            if c and (pathlib.Path(c) / "simde/wasm/simd128.h").is_file():
+                _SIMDE_INC = c
+                break
+    return ["-isystem", _SIMDE_INC] if _SIMDE_INC else []
+
 
 _TOOLVERS: str | None = None
 
@@ -115,7 +162,8 @@ def tool_versions() -> str:
             (HERE / "unatomic.py").read_bytes()
             + (HERE / "icount.py").read_bytes()
             + pathlib.Path(metering.__file__).read_bytes()).hexdigest()[:16]
-        _TOOLVERS = f"{wv}|{cv}|{src}|ic={os.environ.get('KVMRUN_ICOUNT', '')}"
+        _TOOLVERS = (f"{wv}|{cv}|{src}|ic={os.environ.get('KVMRUN_ICOUNT', '')}"
+                     f"|w2c={' '.join(wasm2c_flags())}")
     return _TOOLVERS
 
 
@@ -159,7 +207,7 @@ def engine_c() -> pathlib.Path:
             if icount_enabled() and not icount.instrumented(blob):
                 src = tmp / "engine.ic.wasm"
                 src.write_bytes(icount.rewrite(blob))
-            sh([str(WABT_BIN / "wasm2c"), "-n", "engine", "--enable-exceptions",
+            sh([str(WABT_BIN / "wasm2c"), "-n", "engine", *wasm2c_flags(),
                 "-o", str(tmp / "engine.c"), str(src)])
             os.replace(tmp / "engine.h", d / "engine.h")
             os.replace(tmp / "engine.c", d / "engine.c")
@@ -183,7 +231,7 @@ def bot_c(wasm: pathlib.Path, mod: str) -> pathlib.Path:
         try:
             lowered = tmp / f"{mod}.lowered.wasm"
             lowered.write_bytes(unatomic.rewrite(blob))
-            sh([str(WABT_BIN / "wasm2c"), "-n", mod, "--enable-exceptions",
+            sh([str(WABT_BIN / "wasm2c"), "-n", mod, *wasm2c_flags(),
                 "-o", str(tmp / f"{mod}.c"), str(lowered)])
             # .c last: its presence implies .h and .lowered.wasm landed
             for f in (f"{mod}.h", f"{mod}.lowered.wasm", f"{mod}.c"):
@@ -251,11 +299,12 @@ def native_march() -> list[str]:
 
 def native_flags() -> list[str]:
     """Extra compile/link flags for host-side objects on this platform."""
+    f = simde_flags()
     if IS_WINDOWS:
         # <pthread.h>/<unistd.h> resolve to the Win32 shims; no -pthread/-lm
         # (MSVC/clang-cl target has no libm split and no pthread lib).
-        return [f"-I{HERE / 'win32' / 'include'}"]
-    return ["-pthread"]
+        return [f"-I{HERE / 'win32' / 'include'}"] + f
+    return ["-pthread"] + f
 
 
 def link_or_copy(link: pathlib.Path, target: pathlib.Path) -> None:
@@ -371,6 +420,7 @@ def runner_key(backend: str, link_objs: list[pathlib.Path],
         for f in sorted((HERE / "guest" / "include").rglob("*")):
             if f.is_file():
                 h.update(f.read_bytes())
+    h.update(" ".join(native_flags()).encode())
     for k in ("KVMRUN_CFLAGS", "KVMRUN_OBJCFLAGS", "KVMRUN_OPT",
               "KVMRUN_DEPTHCOUNT", "KVMRUN_PROF"):
         h.update(k.encode() + b"=" + os.environ.get(k, "").encode() + b"\0")

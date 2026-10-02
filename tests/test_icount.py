@@ -25,6 +25,7 @@ from unswbc.metering import next_op, sections, uleb  # noqa: E402
 
 
 def wabt_bin() -> pathlib.Path:
+    exe = "wat2wasm.exe" if os.name == "nt" else "wat2wasm"
     cands = []
     if os.environ.get("WABT_BIN"):
         cands.append(os.environ["WABT_BIN"])
@@ -33,7 +34,7 @@ def wabt_bin() -> pathlib.Path:
         cands.append(str(pathlib.Path(w).parent))
     cands += ["/tmp/wabt-pkg/usr/bin", "/usr/bin", "/usr/local/bin"]
     for cand in cands:
-        if (pathlib.Path(cand) / "wat2wasm").is_file():
+        if (pathlib.Path(cand) / exe).is_file():
             return pathlib.Path(cand)
     raise SystemExit("test_icount: cannot find wabt tools; set WABT_BIN")
 

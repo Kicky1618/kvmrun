@@ -64,11 +64,22 @@
   by the real exports) — weak undefined references do not link under zig's
   Mach-O linker, so keep the `KVMRUN_WEAK` definition pattern.
 - `native` backend targets Linux/macOS/Windows: `win32/include` provides
-  `<pthread.h>` (CRITICAL_SECTION/CONDITION_VARIABLE/CreateThread shims)
-  and `<unistd.h>` (`getcwd`); `host.c` uses `rand_s` for seed entropy on
-  `_WIN32` and `rd_tsc` is arch-gated (rdtsc / `cntvct_el0` / `real_ns`).
-  Verified via zig cross-compile: x86_64-windows links `runner.exe`,
-  aarch64-macos links a Mach-O exe. Not runtime-tested off Linux.
+  `<pthread.h>` (CRITICAL_SECTION/CONDITION_VARIABLE/CreateThread shims —
+  reserve-only stacks — plus a macro-renamed `clock_gettime` over
+  QPC/FileTime so nothing pulls in libwinpthread-1.dll) and `<unistd.h>`
+  (`getcwd`); `host.c` uses `rand_s` for seed entropy on `_WIN32` and
+  `rd_tsc` is arch-gated (rdtsc / `cntvct_el0` / `real_ns`). Runtime-verified
+  on macOS arm64 (byte-identical arena replay vs official sandbox) and
+  Windows Server 2022 (llvm-mingw); zig cross-compile also links
+  x86_64-windows `runner.exe` and an aarch64-macos Mach-O exe.
+- Same-bot builds (`wa == wb` bytes) alias `w2c_botb_*` to `w2c_bota_*`
+  via the `SAME_BOT_SHIM` header macros — every `w2c_botb_*` reference in
+  `host.c`, including function *definitions*, must stay `#ifndef`-guarded
+  so macro expansion cannot produce a duplicate definition.
+- `wasm2c` flags are probed (`wasm2c_flags`): `--enable-exceptions` was
+  removed in newer wabt (exceptions always on) — never pass it blindly.
+  `simde_flags()` probes SIMDE_INC/homebrew/macports prefixes for
+  `simde/wasm/simd128.h`; unswbc requires Python ≥ 3.11 or `tomli`.
 
 ## Verified numbers (i7-12700, apex vs kami, seed 11)
 

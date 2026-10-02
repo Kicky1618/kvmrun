@@ -37,10 +37,13 @@ for m in re.finditer(r'__asm__\s+volatile\("rdtsc"', HOST):
 print("rdtsc sites arch-guarded")
 
 # icount accessors: weak *definitions* (NULL stubs), not weak undef decls —
-# zig's Mach-O linker rejects weak imports.
+# zig's Mach-O linker rejects weak imports. Each stub must also sit behind
+# #ifndef — the same-bot shim aliases w2c_botb_* to w2c_bota_* macros, and
+# an unguarded stub re-expands into a duplicate definition.
 for name in ("bota", "botb", "engine"):
-    pat = rf"KVMRUN_WEAK u64 \*w2c_{name}_kvmrun_icount\(w2c_{name} \*inst\) {{"
-    assert re.search(pat, HOST), f"{name}: weak-def stub missing"
-print("icount accessors are weak definitions")
+    fn = f"w2c_{name}_kvmrun_icount"
+    pat = rf"#ifndef {fn}\s*\n\s*KVMRUN_WEAK u64 \*{fn}\(w2c_{name} \*inst\) {{"
+    assert re.search(pat, HOST), f"{name}: weak-def stub missing/unguarded"
+print("icount accessors are #ifndef-guarded weak definitions")
 
 print("test_portability: OK")

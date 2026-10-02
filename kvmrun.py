@@ -85,6 +85,7 @@ sys.path.insert(0, str(HERE))
 
 from unswbc import clangtool, metering  # noqa: E402
 import unatomic  # noqa: E402
+import icount  # noqa: E402
 
 ENGINE_WASM = PKG / "unswbc" / "unswbc_engine.wasm"
 WABT_BIN = _wabt_bin()
@@ -108,8 +109,9 @@ def tool_versions() -> str:
                             text=True).stdout.splitlines()[0].strip()
         src = hashlib.sha256(
             (HERE / "unatomic.py").read_bytes()
+            + (HERE / "icount.py").read_bytes()
             + pathlib.Path(metering.__file__).read_bytes()).hexdigest()[:16]
-        _TOOLVERS = f"{wv}|{cv}|{src}"
+        _TOOLVERS = f"{wv}|{cv}|{src}|ic={os.environ.get('KVMRUN_ICOUNT', '')}"
     return _TOOLVERS
 
 
@@ -148,8 +150,13 @@ def engine_c() -> pathlib.Path:
     if not (d / "engine.c").is_file():
         tmp = pathlib.Path(tempfile.mkdtemp(prefix=d.name + ".", dir=d.parent))
         try:
+            src = ENGINE_WASM
+            blob = ENGINE_WASM.read_bytes()
+            if icount_enabled() and icount.ICOUNT not in blob:
+                src = tmp / "engine.ic.wasm"
+                src.write_bytes(icount.rewrite(blob))
             sh([str(WABT_BIN / "wasm2c"), "-n", "engine", "--enable-exceptions",
-                "-o", str(tmp / "engine.c"), str(ENGINE_WASM)])
+                "-o", str(tmp / "engine.c"), str(src)])
             os.replace(tmp / "engine.h", d / "engine.h")
             os.replace(tmp / "engine.c", d / "engine.c")
         finally:
@@ -166,6 +173,8 @@ def bot_c(wasm: pathlib.Path, mod: str) -> pathlib.Path:
     if not (d / f"{mod}.c").is_file():
         if metering.REMAINING not in blob:
             blob = metering.instrument(blob)
+        if icount_enabled() and icount.ICOUNT not in blob:
+            blob = icount.rewrite(blob)
         tmp = pathlib.Path(tempfile.mkdtemp(prefix=d.name + ".", dir=d.parent))
         try:
             lowered = tmp / f"{mod}.lowered.wasm"
@@ -215,6 +224,10 @@ def host_fsgsbase() -> bool:
 # this pipeline (verified: "engine init trap" on both backends) — keep the
 # default save/restore prologue instead.
 SEGUE_FLAGS = ["-DWASM_RT_ALLOW_SEGUE=1", "-mfsgsbase"]
+
+
+def icount_enabled() -> bool:
+    return os.environ.get("KVMRUN_ICOUNT", "") not in ("", "0")
 
 
 GUEST_CFLAGS = [
@@ -286,6 +299,7 @@ SAME_BOT_SHIM = """\
     w2c_bota_wasmer_metering_remaining_points
 #define w2c_botb_wasmer_metering_points_exhausted \\
     w2c_bota_wasmer_metering_points_exhausted
+#define w2c_botb_kvmrun_icount w2c_bota_kvmrun_icount
 """
 
 

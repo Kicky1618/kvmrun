@@ -37,6 +37,12 @@
 
 #define NORETURN __attribute__((noreturn))
 
+// optional instruction counters, exported only when the module was built
+// with KVMRUN_ICOUNT=1 (absent symbols resolve to NULL)
+u64 *w2c_bota_kvmrun_icount(w2c_bota *inst) __attribute__((weak));
+u64 *w2c_botb_kvmrun_icount(w2c_botb *inst) __attribute__((weak));
+u64 *w2c_engine_kvmrun_icount(w2c_engine *inst) __attribute__((weak));
+
 #define MAX_TURN_POINTS 100000000LL
 #define MAX_MEMORY_PAGES 768
 #define WRITE_SYSCALL_COST 2500000LL
@@ -357,6 +363,7 @@ struct Bot {
     int64_t slept_ns;
     int64_t budget;
     uint64_t live_pts, live_mem;
+    uint64_t *icount, icount_prev, live_ins;
     uint64_t written;
     Rng rng;
 
@@ -387,12 +394,15 @@ static void bot_mark(Bot *b) {
     b->reported = bot_spent(b);
     b->live_pts = (uint64_t)(b->reported - b->turn);
     b->live_mem = b->mem.size;
+    if (b->icount)
+        b->live_ins = *b->icount - b->icount_prev;   // since last refill
 }
 
 static void bot_refill(Bot *b, int64_t points) {
     if (!b->meter) return;
     int64_t gap = bot_spent(b) - b->reported;
     b->turn = b->reported;
+    if (b->icount) b->icount_prev = *b->icount;
     b->ended = false;
     int64_t left = points - gap;
     if (left < 0) left = 0;
@@ -787,6 +797,7 @@ struct Runner {
     uint8_t *long_reply; size_t long_len;
     uint8_t *team_of; int team_cap;      // indexed by dragon id
     uint64_t *pts[2]; size_t npts[2];   // per-team per-turn points
+    uint64_t *ins[2]; size_t nins[2];   // per-team per-turn wasm insns
     double t_start;
 };
 
@@ -794,6 +805,8 @@ static Runner G;
 static jmp_buf eng_exit_jmp;
 static volatile bool eng_exit_armed;
 static int u64cmpv(const void *pa, const void *pb);
+static void stat_line(const char *who, const char *what,
+                      uint64_t *a, size_t n);
 
 static wasm_rt_memory_t *eng_mem(void) { return w2c_engine_memory(&G.eng); }
 
@@ -876,6 +889,11 @@ u32 w2c_unswbc_bot_reply(struct w2c_unswbc *u, u32 dragon, u32 ptr, u32 len,
         int ti = b->team == 'b';
         G.pts[ti] = realloc(G.pts[ti], (G.npts[ti] + 1) * sizeof(uint64_t));
         G.pts[ti][G.npts[ti]++] = b->live_pts;
+    }
+    if (b->live_ins) {
+        int ti = b->team == 'b';
+        G.ins[ti] = realloc(G.ins[ti], (G.nins[ti] + 1) * sizeof(uint64_t));
+        G.ins[ti][G.nins[ti]++] = b->live_ins;
     }
     if (b->failure[0])
         fprintf(stderr, "round %u: bot %u (team %c) %s\n",
@@ -1001,6 +1019,8 @@ static void bot_spawn(int dragon, const uint8_t *init, size_t init_len) {
         wasm2c_bota_instantiate(b->ia, &b->env_i, &b->wasi_i, &b->wasix_i);
         b->meter = w2c_bota_wasmer_metering_remaining_points(b->ia);
         b->exh = w2c_bota_wasmer_metering_points_exhausted(b->ia);
+        if (w2c_bota_kvmrun_icount)
+            b->icount = w2c_bota_kvmrun_icount(b->ia);
     } else {
         wasm_rt_allocate_memory(&b->mem,
                                 wasm2c_botb_min_env_memory,
@@ -1009,7 +1029,10 @@ static void bot_spawn(int dragon, const uint8_t *init, size_t init_len) {
         wasm2c_botb_instantiate(b->ib, &b->env_i, &b->wasi_i, &b->wasix_i);
         b->meter = w2c_botb_wasmer_metering_remaining_points(b->ib);
         b->exh = w2c_botb_wasmer_metering_points_exhausted(b->ib);
+        if (w2c_botb_kvmrun_icount)
+            b->icount = w2c_botb_kvmrun_icount(b->ib);
     }
+    if (b->icount) b->icount_prev = *b->icount;
 
     if ((int)dragon >= G.team_cap) {
         int nc = G.team_cap * 2 + 1024;
@@ -1256,23 +1279,14 @@ static int run_match(const uint8_t *map, size_t map_len, uint32_t debug,
                    res[3], res[4], res[5], res[6], res[7],
                    res[8], res[9], res[10], res[11]);
         for (int ti = 0; ti < 2; ti++) {
-            size_t n = G.npts[ti];
-            if (!n) continue;
-            uint64_t *a = G.pts[ti];
-            qsort(a, n, sizeof(uint64_t), u64cmpv);
-            uint64_t sum = 0;
-            for (size_t i = 0; i < n; i++) sum += a[i];
-            size_t p50 = (50 * n + 99) / 100 - 1;
-            size_t p99 = (99 * n + 99) / 100 - 1;
-            char ps[4][32];
-            uint64_t vs[4] = {a[p50], a[p99], sum / n, a[n - 1]};
-            for (int i = 0; i < 4; i++)
-                if (vs[i] >= 100000) snprintf(ps[i], 32, "%.1fM", vs[i] / 1e6);
-                else snprintf(ps[i], 32, "%" PRIu64, vs[i]);
-            printf("team %c points per turn: p50 %s  p99 %s"
-                   "  mean %s  max %s  (%zu turns)\n",
-                   "AB"[ti], ps[0], ps[1], ps[2], ps[3], n);
+            char who[16];
+            snprintf(who, sizeof who, "team %c", "AB"[ti]);
+            if (G.npts[ti]) stat_line(who, "points", G.pts[ti], G.npts[ti]);
+            if (G.nins[ti]) stat_line(who, "insns", G.ins[ti], G.nins[ti]);
         }
+        if (w2c_engine_kvmrun_icount)
+            printf("engine insns total: %.2fM\n",
+                   (double)*w2c_engine_kvmrun_icount(&G.eng) / 1e6);
         if (prof_on) {
             fprintf(stderr, "ask: n=%llu wall=%llums wait=%llums first=%llums wakes=%llu gate=%llums bot=%llums wlast=%llums tail=%llums nw=%llu nr=%llu\n",
                     (unsigned long long)ask_n,
@@ -1405,4 +1419,20 @@ int kmain(void) {
 static int u64cmpv(const void *pa, const void *pb) {
     uint64_t a = *(const uint64_t *)pa, b = *(const uint64_t *)pb;
     return a < b ? -1 : a > b;
+}
+
+static void stat_line(const char *who, const char *what,
+                      uint64_t *a, size_t n) {
+    qsort(a, n, sizeof(uint64_t), u64cmpv);
+    uint64_t sum = 0;
+    for (size_t i = 0; i < n; i++) sum += a[i];
+    size_t p50 = (50 * n + 99) / 100 - 1;
+    size_t p99 = (99 * n + 99) / 100 - 1;
+    char ps[4][32];
+    uint64_t vs[4] = {a[p50], a[p99], sum / n, a[n - 1]};
+    for (int i = 0; i < 4; i++)
+        if (vs[i] >= 100000) snprintf(ps[i], 32, "%.1fM", vs[i] / 1e6);
+        else snprintf(ps[i], 32, "%" PRIu64, vs[i]);
+    printf("%s %s per turn: p50 %s  p99 %s  mean %s  max %s"
+           "  (%zu turns)\n", who, what, ps[0], ps[1], ps[2], ps[3], n);
 }

@@ -13,6 +13,9 @@
     needed).
   - `python3 tests/test_vmm_hcall.py` — hostile guest hypercalls (needs
     `/dev/kvm`; skips otherwise).
+  - `python3 tests/test_icount.py` — icount instrumentation: op preservation,
+    metering-sequence exclusion, unatomic passthrough, and a wasm2c dynamic
+    count check (needs wabt).
 - Benchmark: `python3 bench.py MAP A B --seeds 11,22 --runs N --backends
   native,kvm --compare --json out.json`. `--compare` writes replays and
   asserts byte-identical output across backends. Always pass explicit seeds
@@ -50,6 +53,11 @@
 - Cache identity (`runner_key`, `engine_c`, `bot_c`) must cover every input
   that changes the artifact: tool versions, transform sources, flags, runtime
   sources/headers.
+- `KVMRUN_ICOUNT=1` inserts `icount.py` between metering and unatomic:
+  `icount += N` at block boundaries over *original* ops — metering's injected
+  `_check`/`_charge`/`_charge_length` sequences are byte-matched and kept but
+  excluded from the count (dropping them silently disables CPU limits — see
+  the `_body` `out += b[k:m]` line; never refactor it away).
 
 ## Verified numbers (i7-12700, apex vs kami, seed 11)
 

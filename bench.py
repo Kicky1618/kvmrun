@@ -27,6 +27,28 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 WIN = re.compile(r"(team [AB] wins|draw) after (\d+) rounds .*?\(([\d.]+)s\)")
+INS = re.compile(r"team ([AB]) insns per turn: p50 (\S+)\s+p99 (\S+)\s+"
+                 r"mean (\S+)\s+max (\S+)\s+\((\d+) turns\)")
+ENG_INS = re.compile(r"engine insns total: ([\d.]+)M")
+
+
+def _num(s: str) -> float:
+    return float(s[:-1]) * 1e6 if s.endswith("M") else float(s)
+
+
+def _parse_insns(stdout: str) -> dict | None:
+    per_team = {}
+    for team, p50, p99, mean, mx, turns in INS.findall(stdout):
+        per_team[team] = {"p50": _num(p50), "p99": _num(p99),
+                          "mean": _num(mean), "max": _num(mx),
+                          "turns": int(turns)}
+    eng = ENG_INS.search(stdout)
+    if not per_team and not eng:
+        return None
+    out = dict(per_team)
+    if eng:
+        out["engine_total"] = float(eng.group(1)) * 1e6
+    return out
 
 
 # Wrap each run in a tiny python subprocess so RUSAGE_CHILDREN reports the
@@ -65,6 +87,7 @@ def one_match(map_p, a, b, backend, seed, replay=None, env=None):
         "match_s": float(m.group(3)) if m else None,
         "result": f"{m.group(1)} round {m.group(2)}" if m else None,
         "rss_mb": round(rss / 1024, 1),
+        "insns": _parse_insns(cp.stdout),
         "stderr_tail": cp.stderr.strip().splitlines()[-40:] if cp.returncode else [],
         "replay": replay,
     }
@@ -110,12 +133,17 @@ def main() -> int:
                     help="byte-compare replays across backends/sandbox")
     ap.add_argument("--cold-build", action="store_true",
                     help="one build+match per backend under a fresh cache dir")
+    ap.add_argument("--icount", action="store_true",
+                    help="build bots+engine with KVMRUN_ICOUNT=1 and report "
+                         "per-turn wasm instruction counts")
     ap.add_argument("--json", help="write results json")
     args = ap.parse_args()
 
     seeds = [int(s, 0) for s in args.seeds.split(",")]
     backends = args.backends.split(",")
     env0 = os.environ.copy()
+    if args.icount:
+        env0["KVMRUN_ICOUNT"] = "1"
     out = {"map": args.map, "a": args.bot_a, "b": args.bot_b,
            "seeds": seeds, "backends": {}}
     replay_paths = {}   # (backend, seed) -> path
@@ -143,9 +171,13 @@ def main() -> int:
                 r = one_match(args.map, args.bot_a, args.bot_b, be, seed,
                               replay=replay, env=env0)
                 runs.append(r)
+                ins = r["insns"] or {}
+                extra = (f" insns/turn A.p50={ins['A']['p50']:.1f}M"
+                         f" B.p50={ins['B']['p50']:.1f}M"
+                         if "A" in ins and "B" in ins else "")
                 print(f"[{be} seed={seed} run{i}] {r['result']} "
                       f"match={r['match_s']}s wall={r['wall_s']}s "
-                      f"rss={r['rss_mb']}MB", file=sys.stderr)
+                      f"rss={r['rss_mb']}MB{extra}", file=sys.stderr)
             # run0 may include a cold in-process build whose compiler RSS
             # inflates RUSAGE_CHILDREN — prefer warm runs for med/max and
             # report the (possibly cold) first-run wall separately.
@@ -156,6 +188,7 @@ def main() -> int:
                 "wall_s_run0": runs[0]["wall_s"],
                 "rss_mb_max": max(r["rss_mb"] for r in warm),
                 "result": runs[0]["result"],
+                "insns": runs[0]["insns"],
             }
             ent.setdefault("runs", []).extend(runs)
 

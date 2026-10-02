@@ -124,7 +124,29 @@ unresolved.
 | `KVMRUN_OPT` | optimization level for generated objects (default `-O2`) |
 | `KVMRUN_DEPTHCOUNT` | `0` disables wasm call-depth counting |
 | `KVMRUN_PROF` | build guest objects with `-finstrument-functions` |
+| `KVMRUN_ICOUNT` | `1` instruments every module with a `kvmrun_icount` global — per-turn and total raw wasm instruction counts are printed after the match and parsed by `bench.py --icount` |
 | `KVMDBG=1` | VMM hcall histograms / single-step dumps |
+
+### Instruction counts
+
+`KVMRUN_ICOUNT=1` runs `icount.py` between metering and unatomic: it
+appends one exported `i64` global and emits `icount += N` at every block
+boundary, where N is the number of original module ops in that block.
+Metering's own injected sequences (`_check`/`_charge`/`_charge_length`)
+are recognized and excluded, so counts cover the module's real ops only —
+the official weighted CPU-point accounting is untouched.
+
+```
+team A insns per turn: p50 5.4M  p99 19.9M  mean 5.9M  max 23.2M  (131 turns)
+engine insns total: 103.56M
+```
+
+Counts are wasm opcodes actually executed (each `block`/`loop`/`end`/`br`
+counts once; `unatomic` helper functions are not included). Per-backend
+runs are deterministic; backends can differ by a few percent where a
+module's executed path depends on host-interaction timing (e.g. how many
+`poll_oneoff`/`read` iterations a wait takes). Replays stay byte-identical
+regardless of instrumentation.
 
 ## Usage
 

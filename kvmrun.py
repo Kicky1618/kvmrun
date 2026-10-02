@@ -109,6 +109,40 @@ WABT_INC = WASM_RT_DIR          # generated code only needs wasm-rt headers
 CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "kvmrun"
 CLANG = os.environ.get("KVMRUN_CC", "clang")
 
+_WASM_OPT: list[str] | None | bool = None
+_WO_FEATS = ["--enable-exception-handling", "--enable-threads",
+             "--enable-bulk-memory", "--enable-sign-ext", "--enable-simd",
+             "--enable-mutable-globals",
+             "--enable-nontrapping-float-to-int", "--enable-reference-types",
+             "--enable-multivalue", "--enable-tail-call",
+             "--enable-extended-const", "--enable-multimemory"]
+
+
+def wasm_opt() -> list[str] | None:
+    """binaryen wasm-opt argv prefix, or None. Applied to the *metered*
+    module (charge constants are already baked in, so optimizing keeps
+    points accounting and replay bytes identical — verified). Needs
+    binaryen >= v133: older releases misparse the new-EH encoding
+    (try_table/throw_ref/catch_ref) and die inside Flatten.
+    KVMRUN_NO_WASMOPT=1 disables; WASM_OPT overrides the binary."""
+    global _WASM_OPT
+    if _WASM_OPT is None:
+        _WASM_OPT = False
+        if os.environ.get("KVMRUN_NO_WASMOPT"):
+            return None
+        exe = os.environ.get("WASM_OPT") or shutil.which("wasm-opt")
+        if exe:
+            try:
+                out = subprocess.run([exe, "--version"], capture_output=True,
+                                     text=True, timeout=10)
+                m = re.search(r"version (\d+)", out.stdout + out.stderr)
+                if m and int(m.group(1)) >= 133:
+                    _WASM_OPT = [exe, "-O3", *_WO_FEATS]
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return _WASM_OPT or None
+
+
 _W2C_FLAGS: list[str] | None = None
 
 
@@ -162,8 +196,10 @@ def tool_versions() -> str:
             (HERE / "unatomic.py").read_bytes()
             + (HERE / "icount.py").read_bytes()
             + pathlib.Path(metering.__file__).read_bytes()).hexdigest()[:16]
+        wo = wasm_opt()
         _TOOLVERS = (f"{wv}|{cv}|{src}|ic={os.environ.get('KVMRUN_ICOUNT', '')}"
-                     f"|w2c={' '.join(wasm2c_flags())}")
+                     f"|w2c={' '.join(wasm2c_flags())}"
+                     f"|wo={' '.join(wo) if wo else ''}")
     return _TOOLVERS
 
 
@@ -225,10 +261,20 @@ def bot_c(wasm: pathlib.Path, mod: str) -> pathlib.Path:
     if not (d / f"{mod}.c").is_file():
         if metering.REMAINING not in blob:
             blob = metering.instrument(blob)
-        if icount_enabled() and not icount.instrumented(blob):
-            blob = icount.rewrite(blob)
         tmp = pathlib.Path(tempfile.mkdtemp(prefix=d.name + ".", dir=d.parent))
         try:
+            wo = wasm_opt()
+            if wo:
+                src = tmp / f"{mod}.in.wasm"
+                opt = tmp / f"{mod}.opt.wasm"
+                src.write_bytes(blob)
+                try:
+                    sh([*wo, "-o", str(opt), str(src)])
+                    blob = opt.read_bytes()
+                except (subprocess.CalledProcessError, OSError):
+                    pass            # unparseable module: run unoptimized
+            if icount_enabled() and not icount.instrumented(blob):
+                blob = icount.rewrite(blob)
             lowered = tmp / f"{mod}.lowered.wasm"
             lowered.write_bytes(unatomic.rewrite(blob))
             sh([str(WABT_BIN / "wasm2c"), "-n", mod, *wasm2c_flags(),

@@ -51,7 +51,10 @@ static void* g_sig_handler_handle = 0;
 
 #if WASM_RT_USE_SEGUE
 bool wasm_rt_fsgsbase_inst_supported = false;
-#ifdef __linux__
+#if defined(KVMRUN_GUEST)
+// Freestanding guest: no libc auxv/syscall. wrgsbase legality is decided by
+// the VMM via guest CR4.FSGSBASE + CPUID leaf 7.
+#elif defined(__linux__)
 #include <sys/auxv.h>
 #ifdef __GLIBC__
 #include <gnu/libc-version.h>
@@ -263,7 +266,23 @@ void wasm_rt_init(void) {
 #endif
 
 #if WASM_RT_USE_SEGUE
-#if defined(__linux__) && defined(__GLIBC__) && __GLIBC__ >= 2 && \
+#if defined(KVMRUN_GUEST)
+  // The VMM sets CR4.FSGSBASE only when CPUID leaf 7 advertises it; check
+  // the same leaf here so a mismatched VMM fails safe instead of #UD.
+  {
+    uint32_t a = 0, b = 0, c = 0, d;
+    __asm__ volatile("cpuid"
+                     : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(a), "c"(c));
+    if (a >= 7) {
+      a = 7; c = 0;
+      __asm__ volatile("cpuid"
+                       : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                       : "a"(a), "c"(c));
+      wasm_rt_fsgsbase_inst_supported = b & 1;
+    }
+  }
+#elif defined(__linux__) && defined(__GLIBC__) && __GLIBC__ >= 2 && \
     __GLIBC_MINOR__ >= 18
   // Check for support for userspace wrgsbase instructions
   unsigned long val = getauxval(AT_HWCAP2);
@@ -325,6 +344,18 @@ void wasm_rt_free_thread(void) {
 }
 
 #if WASM_RT_USE_SEGUE
+#if defined(KVMRUN_GUEST)
+// Reached only when CPUID leaf 7 lacked FSGSBASE while the module was built
+// with segue — fail loudly rather than dereference a stale gs base.
+void wasm_rt_syscall_set_segue_base(void* base) {
+  (void)base;
+  abort();
+}
+void* wasm_rt_syscall_get_segue_base() {
+  abort();
+  return NULL;
+}
+#else
 void wasm_rt_syscall_set_segue_base(void* base) {
   int error_code = 0;
 #ifdef __linux__
@@ -355,6 +386,7 @@ void* wasm_rt_syscall_get_segue_base() {
   }
   return base;
 }
+#endif
 #endif
 
 // Include table operations for funcref

@@ -439,12 +439,25 @@ static void dispatch(Vcpu *v, uint64_t mbx_gpa) {
 
 // ------------------------------------------------------------------ vm setup
 
+static struct kvm_cpuid2 *get_cpuid(void);
+
+static int host_has_fsgsbase(void) {
+    struct kvm_cpuid2 *cp = get_cpuid();
+    if (!cp) return 0;
+    for (uint32_t i = 0; i < cp->nent; i++)
+        if (cp->entries[i].function == 7 && cp->entries[i].index == 0)
+            return !!(cp->entries[i].ebx & 1);
+    return 0;
+}
+
 static struct kvm_sregs init_sregs(void) {
     struct kvm_sregs s;
     memset(&s, 0, sizeof s);
     s.cr3 = 0x1000;
     s.cr0 = 0x80050033;           // PE|MP|ET|NE|WP|PG
     s.cr4 = 0x20 | 0x200 | 0x400 | 0x40000; // PAE|OSFXSR|OSXMMEXCPT|OSXSAVE
+    if (host_has_fsgsbase())
+        s.cr4 |= 0x10000;       // FSGSBASE: guest may rd/wr fs/gs base
     s.efer = 0x500;               // LME|LMA
     struct kvm_segment code = {
         .base = 0, .limit = 0xffffffff, .selector = 0x08,

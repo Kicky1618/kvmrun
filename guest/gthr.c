@@ -56,8 +56,10 @@ typedef struct gctx {
     int done;                            // 112: 1=exited, 2=joined
     int in_z;                            // 116: still linked on zombies
     struct gctx *joinq;                  // 120: join waiters (wq)
+    uint64_t gs;                         // 128: segue base (wasm mem base)
 } gctx;
 
+_Static_assert(__builtin_offsetof(gctx, gs) == 128, "gs off");
 _Static_assert(__builtin_offsetof(gctx, rsp) == 0, "rsp off");
 _Static_assert(__builtin_offsetof(gctx, tp) == 8, "tp off");
 

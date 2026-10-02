@@ -25,7 +25,7 @@ _start:
     hlt
 
     // cooperative ctx switch: rdi=from gctx, rsi=to gctx
-    // gctx layout: +0 saved rsp, +8 tp (fs base)
+    // gctx layout: +0 saved rsp, +8 tp (fs base), +128 gs base (segue)
     .globl gctx_switch
 gctx_switch:
     push %rbp
@@ -35,7 +35,15 @@ gctx_switch:
     push %r14
     push %r15
     mov  %rsp, 0(%rdi)
+#if WASM_RT_ALLOW_SEGUE
+    rdgsbase %rax                   // gs follows the ctx, not the cpu
+    mov  %rax, 128(%rdi)
+#endif
     mov  0(%rsi), %rsp
+#if WASM_RT_ALLOW_SEGUE
+    mov  128(%rsi), %rax
+    wrgsbase %rax
+#endif
     mov  8(%rsi), %rdi              // to->tp
     mov  $0xC0000100, %ecx          // MSR_FS_BASE
     mov  %rdi, %rax

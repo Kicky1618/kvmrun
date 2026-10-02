@@ -146,10 +146,15 @@ def main() -> int:
                 print(f"[{be} seed={seed} run{i}] {r['result']} "
                       f"match={r['match_s']}s wall={r['wall_s']}s "
                       f"rss={r['rss_mb']}MB", file=sys.stderr)
+            # run0 may include a cold in-process build whose compiler RSS
+            # inflates RUSAGE_CHILDREN — prefer warm runs for med/max and
+            # report the (possibly cold) first-run wall separately.
+            warm = runs[1:] or runs
             ent[f"seed_{seed}"] = {
                 "match_s_med": med(runs, "match_s"),
-                "wall_s_med": med(runs, "wall_s"),
-                "rss_mb_max": max(r["rss_mb"] for r in runs),
+                "wall_s_med": med(warm, "wall_s"),
+                "wall_s_run0": runs[0]["wall_s"],
+                "rss_mb_max": max(r["rss_mb"] for r in warm),
                 "result": runs[0]["result"],
             }
             ent.setdefault("runs", []).extend(runs)

@@ -70,17 +70,17 @@ jobs:
           MAPS="$UNSWBC_PKG/unswbc/templates/maps"
           if [ "$HAVE_KVM" = "true" ]; then BE=native,kvm; else BE=native; fi
           python3 bench.py "$MAPS/arena.map" /tmp/bot /tmp/bot \
-            --seeds 11 --runs 1 --backends "$BE" --sandbox --compare \
+            --seeds 11 --runs 2 --backends "$BE" --sandbox --compare \
             --json /tmp/bench-arena.json
 
-      - name: Bench schooltime.map (native + kvm)
+      - name: Bench schooltime.map (native + kvm + sandbox)
         env:
           HAVE_KVM: ${{ steps.kvm.outputs.ok }}
         run: |
           MAPS="$UNSWBC_PKG/unswbc/templates/maps"
           if [ "$HAVE_KVM" = "true" ]; then BE=native,kvm; else BE=native; fi
           python3 bench.py "$MAPS/schooltime.map" /tmp/bot /tmp/bot \
-            --seeds 11 --runs 1 --backends "$BE" --compare \
+            --seeds 11 --runs 2 --backends "$BE" --sandbox --compare \
             --json /tmp/bench-schooltime.json
 
       - name: Summary
@@ -89,8 +89,9 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json, pathlib
           print("## kvmrun CI bench (GitHub-hosted runner)\n")
-          print("| map | backend | wall s | match s | RSS MB | result |")
-          print("|---|---|---|---|---|---|")
+          print("| map | backend | wall s (warm) | run0 s (cold) | match s "
+                "| RSS MB | result |")
+          print("|---|---|---|---|---|---|---|")
           for name in ("arena", "schooltime"):
               p = pathlib.Path(f"/tmp/bench-{name}.json")
               if not p.exists():
@@ -102,12 +103,16 @@ jobs:
                           continue
                       if not k.startswith("seed_"):
                           print(f"| {name} | {be}:{k} | {v.get('wall_s')} | "
-                                f"{v.get('match_s')} | {v.get('rss_mb')} | "
+                                f" | {v.get('match_s')} | {v.get('rss_mb')} | "
                                 f"{v.get('result')} |")
                           continue
                       print(f"| {name} | {be} | {v.get('wall_s_med')} | "
-                            f"{v.get('match_s_med')} | {v.get('rss_mb_max')} | "
-                            f"{v.get('result')} |")
+                            f"{v.get('wall_s_run0')} | {v.get('match_s_med')} | "
+                            f"{v.get('rss_mb_max')} | {v.get('result')} |")
+              sb = d.get("sandbox")
+              if sb:
+                  print(f"| {name} | sandbox | {sb.get('wall_s_med')} |  |  |"
+                        f"  | {sb.get('result')} |")
               rc = d.get("replay_compare", {})
               for seed, r in rc.items():
                   print(f"\n`{name}` seed {seed} replay identical: "

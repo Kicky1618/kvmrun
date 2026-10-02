@@ -37,6 +37,13 @@
   zombie-list membership — do not `free()` a gctx directly.
 - `guest_now()` is rdtsc-calibrated against `HC_NOW` and resyncs every ~4 s;
   deadlines cross to the host as host `CLOCK_MONOTONIC` ns.
+- wasm2c "segue" (`WASM_RT_ALLOW_SEGUE`) is enabled when the host has
+  `fsgsbase`: generated code accesses linear memory through `%gs` set to the
+  memory base at every exported call. In the guest this makes `gs` part of a
+  context's state — `gctx_switch` must save/restore `gctx.gs` (offset 128) and
+  the VMM sets CR4.FSGSBASE only when CPUID leaf 7 advertises it. Do NOT enable
+  `WASM_RT_SEGUE_FREE_SEGMENT`: verified to break call_indirect in this
+  pipeline.
 - VMM hypercall entry points must validate every guest-controlled pointer
   (`gptr`), length, and mailbox GPA before use — `tests/test_vmm_hcall.py`
   locks this in.

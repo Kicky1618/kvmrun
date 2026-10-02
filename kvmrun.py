@@ -192,6 +192,31 @@ def clang_res_inc() -> pathlib.Path:
     return _RES_INC
 
 
+_FSGSBASE: bool | None = None
+
+
+def host_fsgsbase() -> bool:
+    """True when the host exposes rd/wr fs/gs base (segue-capable builds).
+
+    The wrgsbase builtins clang emits require the fsgsbase target feature,
+    so without host support we must not define WASM_RT_ALLOW_SEGUE at all.
+    """
+    global _FSGSBASE
+    if _FSGSBASE is None:
+        try:
+            _FSGSBASE = "fsgsbase" in pathlib.Path(
+                "/proc/cpuinfo").read_text()
+        except OSError:
+            _FSGSBASE = False
+    return _FSGSBASE
+
+
+# NOTE: WASM_RT_SEGUE_FREE_SEGMENT breaks generated call_indirect paths in
+# this pipeline (verified: "engine init trap" on both backends) — keep the
+# default save/restore prologue instead.
+SEGUE_FLAGS = ["-DWASM_RT_ALLOW_SEGUE=1", "-mfsgsbase"]
+
+
 GUEST_CFLAGS = [
     "-DKVMRUN_GUEST", "-ffreestanding", "-fno-stack-protector", "-fno-pic",
     "-mno-red-zone", "-nostdinc",
@@ -208,6 +233,7 @@ GUEST_CFLAGS = [
     # Debian/Ubuntu multiarch glibc headers (bits/…) live under
     # /usr/include/<triplet> — add when present so simde->fenv.h resolves
     *sum((["-isystem", d] for d in glob.glob("/usr/include/*-linux-gnu")), []),
+    *(SEGUE_FLAGS if host_fsgsbase() else []),
 ]
 
 
@@ -221,6 +247,7 @@ def compile_obj(cdir: pathlib.Path, mod: str, extra_inc: pathlib.Path,
                 guest: bool = False) -> pathlib.Path:
     flags = (guest_cflags() if guest else
              ["-pthread", "-DWASM_RT_MAX_CALL_STACK_DEPTH=262144"]
+             + (SEGUE_FLAGS if host_fsgsbase() else [])
              + os.environ.get("KVMRUN_OBJCFLAGS", "").split())
     if os.environ.get("KVMRUN_PROF"):
         flags += ["-finstrument-functions"]
@@ -376,6 +403,7 @@ def build(backend: str, arg_a: str, arg_b: str):
             # wasm-rt runtime
             rt_objs = []
             rt_extra = os.environ.get("KVMRUN_OBJCFLAGS", "").split()
+            rt_extra += SEGUE_FLAGS if host_fsgsbase() else []
             for src in RT_SRCS:
                 out = work / (pathlib.Path(src).stem + ".o")
                 sh([CLANG, "-O1", "-pthread", "-c", *rt_extra,
@@ -407,7 +435,9 @@ def build(backend: str, arg_a: str, arg_b: str):
                 str(HERE / "guest" / src)])
             gsup.append(out)
         ent = work / "entry.o"
-        sh([CLANG, "-c", "-o", str(ent), str(HERE / "guest" / "entry.S")])
+        sh([CLANG, "-c",
+            *(["-DWASM_RT_ALLOW_SEGUE=1"] if host_fsgsbase() else []),
+            "-o", str(ent), str(HERE / "guest" / "entry.S")])
         ghost = work / "host.guest.o"
         sh([CLANG, "-O1", "-c", *guest_cflags(), f"-I{WABT_INC}",
             f"-I{WASM_RT_DIR}", f"-I{work}", f"-I{HERE}",

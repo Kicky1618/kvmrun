@@ -86,6 +86,13 @@ unresolved.
 - **Allocator repair** — stale `heap_tail` after block split/coalesce
   orphaned freed blocks: `help.map` kvm RSS was ~2.2 GB with the bug, now
   ~0.7 GB.
+- **wasm2c segue** — on hosts with `fsgsbase` (any modern Intel/AMD) generated
+  code is built with `WASM_RT_ALLOW_SEGUE=1`: linear-memory accesses go
+  through `%gs` (base = the wasm memory) instead of an explicit base add on
+  every load/store. In the KVM backend `gs` becomes per-context state —
+  `gctx_switch` saves/restores it, and the VMM sets guest CR4.FSGSBASE only
+  when CPUID leaf 7 advertises it. On a loaded box `schooltime.map` in-guest
+  time measured 56.9 s → 47.8 s (indicative, not a clean benchmark).
 - Wall time on `help.map` (seed 11): native ~172–187 s, kvm ~172–181 s
   across runs vs a ~175 s same-session baseline — parity within machine
   noise. `-O3` was measured *slower* than `-O2` on generated code and is

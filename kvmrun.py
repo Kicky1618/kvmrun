@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import glob
 import importlib.util
 import os
 import pathlib
@@ -204,6 +205,9 @@ GUEST_CFLAGS = [
     "-DWASM_RT_MAX_CALL_STACK_DEPTH=262144",
     "-DNDEBUG",
     "-isystem", "/usr/include",   # simde headers for wasm2c SIMD (last resort)
+    # Debian/Ubuntu multiarch glibc headers (bits/…) live under
+    # /usr/include/<triplet> — add when present so simde->fenv.h resolves
+    *sum((["-isystem", d] for d in glob.glob("/usr/include/*-linux-gnu")), []),
 ]
 
 

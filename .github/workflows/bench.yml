@@ -1,0 +1,112 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install unswbc + wabt
+        run: |
+          pip install "unswbc==1.2.3"
+          curl -fsSL -o /tmp/wabt.tar.gz \
+            https://github.com/WebAssembly/wabt/releases/download/1.0.41/wabt-1.0.41-linux-x64.tar.gz
+          mkdir -p /tmp/wabt
+          tar -xzf /tmp/wabt.tar.gz -C /tmp/wabt --strip-components=1
+          echo "WABT_BIN=/tmp/wabt/bin" >> "$GITHUB_ENV"
+          /tmp/wabt/bin/wasm2c --version
+          unswbc --version || true
+
+      - name: Check /dev/kvm
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm || true
+            ls -l /dev/kvm
+            [ -w /dev/kvm ] && echo "ok=true" >> "$GITHUB_OUTPUT" || echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "no /dev/kvm on this runner"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare map and template bot
+        run: |
+          PKG=$(python3 -c "import unswbc, pathlib; print(pathlib.Path(unswbc.__file__).parent)")
+          echo "UNSWBC_PKG=$PKG" >> "$GITHUB_ENV"
+          mkdir -p /tmp/bot
+          cp "$PKG/templates/cpp/"* /tmp/bot/
+          printf '[project]\nlanguage = "c++"\ninclude = ["*.cpp", "*.hpp", "*.cc", "*.hh", "*.c", "*.h"]\n' \
+            > /tmp/bot/bot.toml
+          ls "$PKG/templates/maps" | head
+
+      - name: Unit tests
+        run: |
+          python3 tests/test_unatomic.py
+          python3 tests/test_vmm_elf.py
+          python3 tests/test_vmm_hcall.py   # self-skips without /dev/kvm
+
+      - name: Bench arena.map (native + kvm + sandbox)
+        env:
+          HAVE_KVM: ${{ steps.kvm.outputs.ok }}
+        run: |
+          MAPS="$UNSWBC_PKG/templates/maps"
+          if [ "$HAVE_KVM" = "true" ]; then BE=native,kvm; else BE=native; fi
+          python3 bench.py "$MAPS/arena.map" /tmp/bot /tmp/bot \
+            --seeds 11 --runs 1 --backends "$BE" --sandbox --compare \
+            --json /tmp/bench-arena.json
+
+      - name: Bench schooltime.map (native + kvm)
+        env:
+          HAVE_KVM: ${{ steps.kvm.outputs.ok }}
+        run: |
+          MAPS="$UNSWBC_PKG/templates/maps"
+          if [ "$HAVE_KVM" = "true" ]; then BE=native,kvm; else BE=native; fi
+          python3 bench.py "$MAPS/schooltime.map" /tmp/bot /tmp/bot \
+            --seeds 11 --runs 1 --backends "$BE" --compare \
+            --json /tmp/bench-schooltime.json
+
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          print("## kvmrun CI bench (GitHub-hosted runner)\n")
+          print("| map | backend | wall s | match s | RSS MB | result |")
+          print("|---|---|---|---|---|---|")
+          for name in ("arena", "schooltime"):
+              p = pathlib.Path(f"/tmp/bench-{name}.json")
+              if not p.exists():
+                  continue
+              d = json.loads(p.read_text())
+              for be, ent in d["backends"].items():
+                  for k, v in ent.items():
+                      if not k.startswith("seed_"):
+                          print(f"| {name} | {be}:{k} | {v.get('wall_s')} | "
+                                f"{v.get('match_s')} | {v.get('rss_mb')} | "
+                                f"{v.get('result')} |")
+                          continue
+                      print(f"| {name} | {be} | {v.get('wall_s_med')} | "
+                            f"{v.get('match_s_med')} | {v.get('rss_mb_max')} | "
+                            f"{v.get('result')} |")
+              rc = d.get("replay_compare", {})
+              for seed, r in rc.items():
+                  print(f"\n`{name}` seed {seed} replay identical: "
+                        f"**{r['identical']}** ({r['sizes']})")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: /tmp/bench-*.json
+          if-no-files-found: ignore

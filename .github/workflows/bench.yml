@@ -16,8 +16,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install unswbc + wabt
+      - name: Install unswbc + wabt + simde
         run: |
+          # simde headers: wasm2c emits <simde/wasm/simd128.h> for SIMD modules;
+          # the wabt release tarball does not ship them
+          sudo apt-get update -qq && sudo apt-get install -y -qq libsimde-dev
           pip install "unswbc==1.2.3"
           curl -fsSL -o /tmp/wabt.tar.gz \
             https://github.com/WebAssembly/wabt/releases/download/1.0.41/wabt-1.0.41-linux-x64.tar.gz

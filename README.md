@@ -98,6 +98,9 @@ unresolved.
 - `clang` and `ld`
 - [wabt](https://github.com/WebAssembly/wabt) (`wasm2c` with
   `--enable-exceptions`)
+- [simde](https://github.com/simd-everywhere/simde) headers
+  (`libsimde-dev` / `simde`) — wasm2c emits `<simde/wasm/simd128.h>` for
+  SIMD-enabled modules
 - the `unswbc` package (the judge toolchain, engine wasm, and metering pass):
   `uv tool install unswbc` — auto-detected from the `unswbc` console script's
   venv, an importable install, or `~/.local/share/uv/tools/unswbc`

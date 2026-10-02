@@ -7,5 +7,6 @@ extern int errno;
 #define ENOMEM 12
 #define EINVAL 22
 #define EPIPE 32
+#define EDEADLK 35
 #define ETIMEDOUT 110
 #endif

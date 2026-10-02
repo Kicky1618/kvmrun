@@ -4,8 +4,9 @@
 #include <time.h>
 
 typedef uint64_t pthread_t;
-typedef struct { volatile uint32_t v; volatile uint32_t waiters; } pthread_mutex_t;
-typedef struct { volatile uint32_t seq; volatile uint32_t waiters; } pthread_cond_t;
+struct gctx;
+typedef struct { volatile uint32_t v; struct gctx *wq; } pthread_mutex_t;
+typedef struct { volatile uint32_t seq; struct gctx *wq; } pthread_cond_t;
 typedef void pthread_mutexattr_t;
 typedef void pthread_condattr_t;
 typedef void pthread_attr_t;

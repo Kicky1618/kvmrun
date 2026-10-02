@@ -104,16 +104,16 @@ def read_limits(b, i):
 
 # ---------------------------------------------------------------- helpers
 
-LOAD_PLAIN = {0x10: 0x28, 0x11: 0x29, 0x12: 0x2C, 0x13: 0x2E, 0x14: 0x30,
-              0x15: 0x32, 0x16: 0x34}
+LOAD_PLAIN = {0x10: 0x28, 0x11: 0x29, 0x12: 0x2D, 0x13: 0x2F, 0x14: 0x31,
+              0x15: 0x33, 0x16: 0x35}   # subword loads are the *_u (zero-ext) ops
 STORE_PLAIN = {0x17: 0x36, 0x18: 0x37, 0x19: 0x3A, 0x1A: 0x3B, 0x1B: 0x3C,
                0x1C: 0x3D, 0x1D: 0x3E}
 RMW_GROUP = {0x1E: "add", 0x25: "sub", 0x2C: "and", 0x33: "or", 0x3A: "xor",
              0x41: "xchg", 0x48: "cmpxchg"}
-RMW_SHAPE = {  # lane -> (valtype, load_op, store_op)
-    0: (I32, 0x28, 0x36), 1: (I64, 0x29, 0x37),
-    2: (I32, 0x2C, 0x3A), 3: (I32, 0x2E, 0x3B),
-    4: (I64, 0x30, 0x3C), 5: (I64, 0x32, 0x3D), 6: (I64, 0x34, 0x3E),
+RMW_SHAPE = {  # lane -> (valtype, load_op, store_op, natural align exp)
+    0: (I32, 0x28, 0x36, 2), 1: (I64, 0x29, 0x37, 3),
+    2: (I32, 0x2D, 0x3A, 0), 3: (I32, 0x2F, 0x3B, 1),
+    4: (I64, 0x31, 0x3C, 0), 5: (I64, 0x33, 0x3D, 1), 6: (I64, 0x35, 0x3E, 2),
 }
 BINOP = {"add": {I32: 0x6A, I64: 0x7C}, "sub": {I32: 0x6B, I64: 0x7D},
          "and": {I32: 0x71, I64: 0x83}, "or": {I32: 0x72, I64: 0x84},
@@ -140,8 +140,9 @@ def helper_body(sub) -> tuple[bytes, list[int], int]:
     if sub in (1, 2):  # wait32/64: mismatch->1 else 2 (timeout)
         vt = I32 if sub == 1 else I64
         eq = EQ[vt]
+        lop = 0x28 if vt == I32 else 0x29   # compare the full lane width
         body = (b"\x00"                                     # no locals
-                + G + pu(0) + bytes([0x28]) + b"\x02\x00"   # load32 a
+                + G + pu(0) + bytes([lop]) + b"\x02\x00"    # load a
                 + G + pu(1) + eq                            # old == exp
                 + b"\x04\x7f"                               # if (i32)
                 + b"\x41\x02"                               #  -> timeout
@@ -151,7 +152,8 @@ def helper_body(sub) -> tuple[bytes, list[int], int]:
         return body, [I32, vt, I64], I32
     base = 0x1E + 7 * ((sub - 0x1E) // 7)
     lane = sub - base
-    vt, lop, sop = RMW_SHAPE[lane]
+    vt, lop, sop, al = RMW_SHAPE[lane]
+    marg = pu(al) + b"\x00"                       # natural align, offset 0
     name = RMW_GROUP[base]
     if name == "cmpxchg":
         mask = SUBWORD_MASK.get(lane)
@@ -163,23 +165,23 @@ def helper_body(sub) -> tuple[bytes, list[int], int]:
             cmp_ = G + pu(3) + m + G + pu(1) + m + eq
             keep = G + pu(3) + m
         # params 0=a,1=e,2=r; locals: 3=old,4=new
-        body = (G + pu(0) + bytes([lop]) + b"\x02\x00" + T + pu(3)
+        body = (G + pu(0) + bytes([lop]) + marg + T + pu(3)
                 + cmp_ + s_if(vt)
                 + G + pu(2)                                  # rep
                 + b"\x05" + keep                             # old(&mask)
                 + b"\x0b" + S + pu(4)
-                + G + pu(0) + G + pu(4) + bytes([sop]) + b"\x02\x00"
+                + G + pu(0) + G + pu(4) + bytes([sop]) + marg
                 + b"\x0b")
         return b"\x01\x02" + IFT[vt] + body, [I32, vt, vt], vt
     if name == "xchg":
-        body = (G + pu(0) + bytes([lop]) + b"\x02\x00" + T + pu(2)
-                + G + pu(0) + G + pu(1) + bytes([sop]) + b"\x02\x00"
+        body = (G + pu(0) + bytes([lop]) + marg + T + pu(2)
+                + G + pu(0) + G + pu(1) + bytes([sop]) + marg
                 + b"\x0b")
         return b"\x01\x01" + IFT[vt] + body, [I32, vt], vt
     # add/sub/and/or/xor; params 0=a,1=x; locals: 2=old,3=new
-    body = (G + pu(0) + bytes([lop]) + b"\x02\x00" + T + pu(2)
+    body = (G + pu(0) + bytes([lop]) + marg + T + pu(2)
             + G + pu(1) + bytes([BINOP[name][vt]]) + S + pu(3)
-            + G + pu(0) + G + pu(3) + bytes([sop]) + b"\x02\x00"
+            + G + pu(0) + G + pu(3) + bytes([sop]) + marg
             + G + pu(2) + b"\x0b")
     return b"\x01\x02" + IFT[vt] + body, [I32, vt], vt
 
@@ -249,6 +251,10 @@ def skip_op(b, op, i):
             _, _, i = _memarg(b, i)
         elif sub == 3:
             i += 1
+        else:
+            raise ValueError(f"unatomic: unknown threads opcode 0xFE/{sub:#x}")
+    elif op == 0xFB:
+        raise ValueError("unatomic: GC-prefixed opcodes unsupported")
     return i
 
 
@@ -434,6 +440,9 @@ def rewrite(blob: bytes) -> bytes:
     for sub in sorted(needed):
         if sub in LOAD_PLAIN or sub in STORE_PLAIN or sub == 3:
             continue
+        if sub not in (0, 1, 2) and sub not in RMW_GROUP and \
+                all(sub < base or sub >= base + 7 for base in RMW_GROUP):
+            raise ValueError(f"unatomic: no lowering for opcode 0xFE/{sub:#x}")
         body, params, result = helper_body(sub)
         sig = (tuple(params), (result,))
         if sig in types:

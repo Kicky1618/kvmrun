@@ -46,6 +46,8 @@
 #define INITIAL_POINTS ((int64_t)(((uint64_t)1 << 63) - 1))
 #define BUFFER_LIMIT (10 * 1024)
 #define WALL_LIMIT_S 10.0
+#define MAX_IOV 4096                   // cap host-side iov walks (unmetered)
+#define STDERR_CAP (1u << 20)          // bounded diagnostics buffer
 
 // ---------------------------------------------------------------- rng
 
@@ -155,6 +157,7 @@ typedef struct Pipe {
     pthread_cond_t cv;
     pthread_cond_t *wake;            // also signaled on park (turn poller's cv)
     pthread_mutex_t *wake_mu;
+    volatile uint64_t *wake_seq;     // ...and its seq counter (bot->out_seq)
 } Pipe;
 
 static void pipe_init(Pipe *p) {
@@ -175,6 +178,10 @@ static void pipe_feed(Pipe *p, const uint8_t *d, size_t n) {
     pthread_mutex_unlock(&p->mu);
 }
 
+// forward: bump the poller-visible seq and broadcast (under out.mu)
+struct Bot;
+static void bot_kick(struct Bot *b);
+
 static size_t pipe_read(Pipe *p, uint8_t *d, size_t n) {
     pthread_mutex_lock(&p->mu);
     bool parked = false;
@@ -183,9 +190,10 @@ static size_t pipe_read(Pipe *p, uint8_t *d, size_t n) {
             parked = true;
             p->parks++;
             pthread_cond_broadcast(&p->cv);   // wake the turn poller
-            if (p->wake) {
+            if (p->wake) {                    // == &bot->out.cv / &bot->out.mu
                 pthread_mutex_t *wmu = p->wake_mu;
                 pthread_mutex_lock(wmu);
+                if (p->wake_seq) (*p->wake_seq)++;
                 pthread_cond_broadcast(p->wake);
                 pthread_mutex_unlock(wmu);
             }
@@ -233,10 +241,12 @@ static void framer_arm(Framer *f) {
 static const char READY[] = "READY";
 static const char PARKMARK[] = "\x00UNSWBC PARK";
 
-// returns true when ENDTURN arrived (turn ended)
-static bool framer_feed(Framer *f, const uint8_t *d, size_t n) {
+// bit0: ENDTURN arrived (turn ended).  bit1: a PARK line set park_at.
+// Both are "wake the poller" events — writes that produce neither skip the
+// broadcast entirely.
+static int framer_feed(Framer *f, const uint8_t *d, size_t n) {
     pthread_mutex_lock(&f->mu);
-    bool ended = false;
+    int flags = 0;
     for (size_t i = 0; i < n; i++) {
         uint8_t ch = d[i];
         if (ch != '\n') {
@@ -257,12 +267,13 @@ static bool framer_feed(Framer *f, const uint8_t *d, size_t n) {
             }
             while (k < ln) { if (f->line[k] != ' ') ok = false; k++; }
             f->park_at = (any && ok) ? v : -1;
+            if (f->park_at >= 0) flags |= 2;
             continue;
         }
         if (!f->armed) continue;
         if (ln == 7 && !memcmp(f->line, "ENDTURN", 7)) {
             f->armed = false; f->done = true;
-            ended = true;
+            flags |= 1;
             break;
         }
         size_t room = BUFFER_LIMIT - f->out_len;
@@ -274,7 +285,7 @@ static bool framer_feed(Framer *f, const uint8_t *d, size_t n) {
         }
     }
     pthread_mutex_unlock(&f->mu);
-    return ended;
+    return flags;
 }
 
 static size_t framer_take(Framer *f, uint8_t *dst) {
@@ -332,6 +343,7 @@ struct Bot {
 
     pthread_t th;
     volatile bool exited;
+    volatile uint64_t out_seq;           // bumped on every poller-visible event
     int exit_code;
     char failure[160];
 
@@ -439,6 +451,17 @@ static void bot_frozen_set(Bot *b, int v) {
     pthread_mutex_unlock(&b->fmu);
 }
 
+// every poller-visible event funnels through here: seq bump (the predicate
+// the poller actually waits on) + broadcast — always under out.mu so the
+// poller's check-then-wait cannot miss a kick
+static void bot_kick(struct Bot *b_) {
+    Bot *b = b_;
+    pthread_mutex_lock(&b->out.mu);
+    b->out_seq++;
+    pthread_cond_broadcast(&b->out.cv);
+    pthread_mutex_unlock(&b->out.mu);
+}
+
 // memory helpers ----------------------------------------------------------
 
 static void bounds(Bot *b, uint32_t ptr, uint64_t n) {
@@ -492,6 +515,7 @@ u32 w2c_wasi__snapshot__preview1_fd_read(struct w2c_wasi__snapshot__preview1 *w,
     if (!w->bot) { eng_w32(w, out, 0); return WASI_OK; }   // engine: EOF
     Bot *b = w->bot;
     bot_gate(b);
+    if (n > MAX_IOV) return WASI_EINVAL;
     if (fd == 0) return read_stdin(b, iovs, n, out);
     if (fd == 3 || fd == 4) return WASI_EISDIR;
     return WASI_EBADF;
@@ -502,6 +526,7 @@ u32 w2c_wasi__snapshot__preview1_fd_write(struct w2c_wasi__snapshot__preview1 *w
     if (!w->bot) return eng_fd_write_impl(w, fd, iovs, n, out);
     Bot *b = w->bot;
     bot_gate(b);
+    if (n > MAX_IOV) return WASI_EINVAL;
     int64_t total = 0;
     for (uint32_t k = 0; k < n; k++)
         total += (int64_t)rd32(b, iovs + 8 * k + 4);
@@ -516,22 +541,27 @@ u32 w2c_wasi__snapshot__preview1_fd_write(struct w2c_wasi__snapshot__preview1 *w
                 if (!b->t_w1) { b->t_w1 = nw; b->c_w1 = rd_tsc(); }
                 b->t_wlast = nw; b->n_w1++;
             }
-            if (framer_feed(&b->framer, b->mem.data + ptr, len)) {
+            int ev = framer_feed(&b->framer, b->mem.data + ptr, len);
+            if (ev & 1) {
                 // ENDTURN: turn ends; the guest freezes at its next syscall
                 pthread_mutex_lock(&b->fmu);
                 b->frozen = 0;
                 pthread_mutex_unlock(&b->fmu);
             }
-            pthread_mutex_lock(&b->out.mu);
-            pthread_cond_broadcast(&b->out.cv);
-            pthread_mutex_unlock(&b->out.mu);
+            if (ev) bot_kick(b);
         } else if (fd == 2) {
-            if (b->stderr_len + len > b->stderr_cap) {
-                b->stderr_cap = (b->stderr_len + len) * 2 + 256;
-                b->stderr_buf = realloc(b->stderr_buf, b->stderr_cap);
+            // bounded: a bot spamming stderr must not OOM the runner
+            size_t room = STDERR_CAP - b->stderr_len;
+            size_t keep = len < room ? len : room;
+            if (keep) {
+                if (b->stderr_len + keep > b->stderr_cap) {
+                    b->stderr_cap = (b->stderr_len + keep) * 2 + 256;
+                    if (b->stderr_cap > STDERR_CAP) b->stderr_cap = STDERR_CAP;
+                    b->stderr_buf = realloc(b->stderr_buf, b->stderr_cap);
+                }
+                memcpy(b->stderr_buf + b->stderr_len, b->mem.data + ptr, keep);
+                b->stderr_len += keep;
             }
-            memcpy(b->stderr_buf + b->stderr_len, b->mem.data + ptr, len);
-            b->stderr_len += len;
         }
     }
     wr32(b, out, (uint32_t)total);
@@ -908,6 +938,7 @@ static void *bot_main(void *arg) {
     b->exit_armed = false;
     b->exited = true;                // exited bots are never asked again
     b->exit_code = exit_code;
+    bot_kick(b);                     // the poller may be waiting on this bot
     wasm_rt_free_memory(&b->mem);    // mem.size stays valid for accounting
     pipe_close(&b->out);
     return NULL;
@@ -951,6 +982,7 @@ static void bot_spawn(int dragon, const uint8_t *init, size_t init_len) {
     rng_seed(&b->rng, key, name);
     pipe_init(&b->in); pipe_init(&b->out);
     b->in.wake = &b->out.cv; b->in.wake_mu = &b->out.mu;
+    b->in.wake_seq = &b->out_seq;
     framer_init(&b->framer);
     pthread_mutex_init(&b->fmu, NULL);
     pthread_cond_init(&b->fcv, NULL);
@@ -1052,6 +1084,9 @@ static size_t bot_ask(Bot *b, const uint8_t *block, size_t n, uint8_t *dst) {
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_sec += (time_t)WALL_LIMIT_S;
+    pthread_mutex_lock(&b->out.mu);
+    uint64_t seen = b->out_seq;
+    pthread_mutex_unlock(&b->out.mu);
     for (;;) {
         pthread_mutex_lock(&b->framer.mu);
         bool done = b->framer.done;
@@ -1066,9 +1101,16 @@ static size_t bot_ask(Bot *b, const uint8_t *block, size_t n, uint8_t *dst) {
         int parks = b->in.parks;
         pthread_mutex_unlock(&b->in.mu);
         if (parks > (int)parks0) break;
+        // seq-gated wait: a kick that lands between the checks above and the
+        // timedwait still flips out_seq under out.mu, so we see it before we
+        // ever sleep. Writers kick only on real events (ENDTURN/PARK/exit/
+        // first park), so mid-turn chunk writes no longer wake us.
         pthread_mutex_lock(&b->out.mu);
         struct timespec ts = dl;
-        int r = pthread_cond_timedwait(&b->out.cv, &b->out.mu, &ts);
+        int r = 0;
+        if (b->out_seq == seen)
+            r = pthread_cond_timedwait(&b->out.cv, &b->out.mu, &ts);
+        seen = b->out_seq;
         wakes++;
         pthread_mutex_unlock(&b->out.mu);
         if (r == ETIMEDOUT) {

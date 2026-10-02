@@ -45,23 +45,52 @@ match runs start instantly.
 
 ## Benchmarks
 
-Measured on a 12th-gen i7-12700 (20 threads), `apex` vs `kami`, seed 11,
-identical match outcomes verified across all three runs. Times are the
-engine-reported match duration; bot wasm builds were already cached for both
-tools (kvmrun's first build adds ~12 s).
+Measured on a 12th-gen i7-12700 (20 threads), `apex` vs `kami`, official maps
+only. Times are the engine-reported match duration with warm build caches
+(kvmrun's first build adds ~10–15 s). Replays verified **byte-identical**
+across `native`, `kvm`, and — where run to completion — `--sandbox`.
 
 | map | match length | `unswbc run --sandbox` | kvmrun `native` | kvmrun `kvm` |
 |---|---|---|---|---|
-| `arena.map` | 44 rounds | 16.8 s | **0.6 s** (~28×) | **0.3 s** (~56×) |
-| `schooltime.map` | 179 rounds, 7,115 turns | ~20–30 min (projected) | **~22 s** (~60–80×) | **~24 s** (~50–75×) |
+| `arena.map` | 44 rounds | 16.8 s | **0.55 s** (~31×) | **0.3 s** (~56×) |
+| `schooltime.map` | 179 rounds, 7,115 turns | ~20–30 min (projected) | **16.0 s** (~75–110×) | **16.2 s** (~74–110×) |
+| `help.map` | 500 rounds, ~62k turns | not measured (hours) | **171.6 s** | **~172 s** |
+
+Reproduce: `python3 bench.py MAP BOT_A BOT_B --seeds 11 --runs N --backends
+native,kvm --compare` — always compare on the same explicit seed set and run
+serially (concurrent jobs skew both timing and the per-run peak-RSS sample).
 
 The schooltime sandbox run was killed at round 51/179 after ~6 minutes
 (~5–8 s/round and growing with the dragon count); its own pace implies
 ~20–30 minutes to elimination.
 
-Note that `kvm` can be *slower* than `native` on long matches — that is the
-point: one vCPU serialises all bot threads, mirroring the judge's CPU-point
-contention model instead of spreading bots across host cores.
+Note that `kvm` can be *slower* than `native` on mid-size matches — that is
+the point: one vCPU serialises all bot threads, mirroring the judge's
+CPU-point contention model instead of spreading bots across host cores. On
+`help.map` the two backends are within noise of each other; run-to-run
+variance on a loaded host reaches ±10 %, so treat differences below that as
+unresolved.
+
+### Performance notes (this vs the original implementation)
+
+- **rdtsc guest clock** — `clock_gettime` used to be an `HC_NOW` hypercall
+  (VM exit) per call; it is now a calibrated TSC read resynced every ~4 s.
+  VM exits on `help.map`: ~68k → ~5.5k.
+- **Per-primitive wait queues** — guest mutex/cond/futex/join waiters went
+  from a global blocked-list scan to intrusive O(1) queues, and
+  `pthread_join` is real now (it used to be a no-op that returned without
+  waiting and handed back no return value).
+- **Event-driven poller** — host writes kick the turn poller only on real
+  events (ENDTURN / PARK / exit / first park) instead of broadcasting on
+  every output chunk; also fixes a check-then-wait lost-wakeup race.
+- **Allocator repair** — stale `heap_tail` after block split/coalesce
+  orphaned freed blocks: `help.map` kvm RSS was ~2.2 GB with the bug, now
+  ~0.7 GB.
+- Wall time on `help.map` (seed 11): native ~172–187 s, kvm ~172–181 s
+  across runs vs a ~175 s same-session baseline — parity within machine
+  noise. `-O3` was measured *slower* than `-O2` on generated code and is
+  not used.
+- Security hardening and test coverage are documented in `SECURITY.md`.
 
 ## Requirements
 

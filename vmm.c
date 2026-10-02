@@ -105,7 +105,14 @@ static void stem_of(const char *arg, char *out) {
     if (!*out) snprintf(out, 128, "bot");
 }
 
+#define REPLAY_MAX (256ull << 20)   // replays are ~MBs; refuse absurd sizes
 static void hc_replay(struct hcall *m) {
+    if (m->b > REPLAY_MAX) {
+        fprintf(stderr, "vmm: replay size %llu exceeds cap\n",
+                (unsigned long long)m->b);
+        m->ret = (uint64_t)-1;
+        return;
+    }
     uint8_t *blob = gptr(m->a, m->b);
     if (!blob) { m->ret = (uint64_t)-1; return; }
     char rpath[1024];
@@ -211,7 +218,9 @@ static void futex_wait(Vcpu *v, struct hcall *m) {
     for (;;) {
         int r = deadline ? pthread_cond_timedwait(&v->cv, &v->mu, &ts)
                          : (pthread_cond_wait(&v->cv, &v->mu), 0);
-        if (v->state != 1 || r == ETIMEDOUT) break;
+        // any non-zero return (timeout or error like EINVAL) ends the wait;
+        // retrying on EINVAL would spin forever
+        if (v->state != 1 || r != 0) break;
     }
     m->ret = v->park_ret;
     v->state = 0;
@@ -235,6 +244,15 @@ static int g_singlestep;
 static int g_dbg;
 
 static void dispatch(Vcpu *v, uint64_t mbx_gpa) {
+    // Mailboxes live in fixed places only: the BSP page and the arena slots.
+    // Anything else means guest corruption — refuse before touching it.
+    if (mbx_gpa != BSP_MBX_GPA &&
+        (mbx_gpa < MBX_ARENA_GPA ||
+         mbx_gpa >= MBX_ARENA_GPA + MBX_ARENA_BYTES ||
+         (mbx_gpa & (MBX_SIZE - 1)))) {
+        fprintf(stderr, "vmm: bad mbx gpa %llx\n", (unsigned long long)mbx_gpa);
+        return;
+    }
     struct hcall *m = (struct hcall *)gptr(mbx_gpa, sizeof *m);
     if (!m) { fprintf(stderr, "vmm: bad mbx %llx\n", (unsigned long long)mbx_gpa); return; }
     {
@@ -252,10 +270,12 @@ static void dispatch(Vcpu *v, uint64_t mbx_gpa) {
         m->ret = 0;
         break;
     case HC_PRINT: {
+        // legit prints are kprint diagnostics — refuse multi-GiB floods
+        if (m->c > (16ull << 20)) { m->ret = (uint64_t)-1; break; }
         uint8_t *b = gptr(m->b, m->c);
         if (b) fwrite(b, 1, m->c, m->a == 2 ? stderr : stdout);
         fflush(m->a == 2 ? stderr : stdout);
-        m->ret = m->c;
+        m->ret = b ? m->c : (uint64_t)-1;
         break;
     }
     case HC_EXIT: {
@@ -298,6 +318,7 @@ static void dispatch(Vcpu *v, uint64_t mbx_gpa) {
             uint64_t *h = (uint64_t *)gptr(prof_gpa, prof_len);
             uint64_t nb = prof_len / 8;
             uint64_t total = 0;
+            if (!h) goto prof_done;
             for (uint64_t i = 0; i < nb; i++) total += h[i];
             if (!total) goto prof_done;
             fprintf(stderr, "vmm: prof total=%llu top:\n",
@@ -356,6 +377,13 @@ static void dispatch(Vcpu *v, uint64_t mbx_gpa) {
         hc_replay(m);
         break;
     case HC_PROF:
+        // validate now: the histogram is dereferenced at HC_EXIT — a bad
+        // GPA/len here must not turn exit-time stats into a NULL deref
+        if (!m->b || (m->b & 7) || m->b > (8ull << 20) ||
+            !gptr(m->a, m->b)) {
+            m->ret = (uint64_t)-1;
+            break;
+        }
         prof_gpa = m->a; prof_len = m->b;
         m->ret = 0;
         break;
@@ -582,6 +610,11 @@ static void *vcpu_loop(void *arg) {
         struct kvm_run *run = v->run;
         if (run->exit_reason == KVM_EXIT_MMIO &&
             run->mmio.phys_addr == DOORBELL_GPA && run->mmio.is_write) {
+            if (run->mmio.len < 8) {            // short write: no full GPA
+                fprintf(stderr, "vmm: short doorbell write (%u)\n",
+                        run->mmio.len);
+                continue;
+            }
             uint64_t mbx;
             memcpy(&mbx, run->mmio.data, 8);
             dispatch(v, mbx);
@@ -683,21 +716,34 @@ static void *vcpu_loop(void *arg) {
 
 // ------------------------------------------------------------------ elf load
 
+static void elf_bad(const char *path, const char *what) {
+    fprintf(stderr, "vmm: %s: bad ELF (%s)\n", path, what);
+    exit(2);
+}
+
 static void load_elf(void *mem, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) die(path);
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END)) die("seek elf");
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) die("elf size");
+    if (fseek(f, 0, SEEK_SET)) die("seek elf");
     uint8_t *img = malloc(sz);
+    if (!img) die("elf malloc");
     if (fread(img, 1, sz, f) != (size_t)sz) die("read elf");
     fclose(f);
     if (sz < 0x40 || memcmp(img, "\x7f""ELF", 4) || img[4] != 2 || img[5] != 1)
-        { fprintf(stderr, "vmm: %s not a 64-bit LE ELF\n", path); exit(2); }
+        elf_bad(path, "not a 64-bit LE ELF");
+    if (img[6] != 1) elf_bad(path, "version");
     uint64_t entry = *(uint64_t *)(img + 24);
     uint64_t phoff = *(uint64_t *)(img + 32);
     uint16_t phentsize = *(uint16_t *)(img + 54);
     uint16_t phnum = *(uint16_t *)(img + 56);
+    if (entry >= RAM_BYTES) elf_bad(path, "entry out of range");
+    if (phentsize < 56) elf_bad(path, "phentsize");
+    if (phnum && (phoff >= (uint64_t)sz ||
+                  phoff + (uint64_t)phnum * phentsize > (uint64_t)sz))
+        elf_bad(path, "phdr table out of range");
     for (int i = 0; i < phnum; i++) {
         uint8_t *ph = img + phoff + i * phentsize;
         if (*(uint32_t *)ph != 1) continue;        // PT_LOAD
@@ -705,6 +751,11 @@ static void load_elf(void *mem, const char *path) {
         uint64_t va = *(uint64_t *)(ph + 16);
         uint64_t filesz = *(uint64_t *)(ph + 32);
         uint64_t memsz = *(uint64_t *)(ph + 40);
+        if (filesz > memsz) elf_bad(path, "filesz > memsz");
+        if (off > (uint64_t)sz || filesz > (uint64_t)sz - off)
+            elf_bad(path, "segment data out of range");
+        if (va >= RAM_BYTES || memsz > RAM_BYTES - va)
+            elf_bad(path, "segment vaddr out of guest RAM");
         memcpy((uint8_t *)mem + va, img + off, filesz);
         memset((uint8_t *)mem + va + filesz, 0, memsz - filesz);
     }

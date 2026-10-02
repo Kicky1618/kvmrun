@@ -129,6 +129,8 @@ static void blk_check(Blk *b, uint64_t where, void *arg) {
     for (;;) __asm__ volatile("hlt");
 }
 
+static Blk *heap_tail;          // bump allocs always land at the tail
+
 static Blk *blk_new(uint64_t need) {
     uint64_t sz = (need + BLK_H + 15) & ~15ull;
     if (heap_next + sz > phys_next) return NULL;   // heap cap = phys pool
@@ -138,11 +140,8 @@ static Blk *blk_new(uint64_t need) {
     b->pristine = 1;            // bump region has never been written
     // keep address order: append at list tail (bump alloc => always tail)
     if (!heap_head) heap_head = b;
-    else {
-        Blk *t = heap_head;
-        while (t->next) t = t->next;
-        t->next = b;
-    }
+    else heap_tail->next = b;
+    heap_tail = b;
     return b;
 }
 
@@ -165,6 +164,7 @@ void *malloc(size_t n) {
                 r->free = 1; r->next = b->next;
                 r->magic = BLK_MAGIC; r->pristine = 0;
                 b->next = r; b->size = need + BLK_H;
+                if (heap_tail == b) heap_tail = r;   // split produced a tail
             }
             b->free = 0;
             b->pristine = 0;    // recycled: contents are stale
@@ -192,6 +192,7 @@ void free(void *p) {
         if (!b->next || !b->next->free ||
             (uint8_t *)b + b->size != (uint8_t *)b->next) break;
         if (free_hint == b->next) free_hint = b;
+        if (b->next == heap_tail) heap_tail = b;   // absorbed the tail
         b->size += b->next->size;
         b->next = b->next->next;
     }
@@ -870,8 +871,50 @@ void __assert_fail(const char *e, const char *f, unsigned l, const char *fn) {
 }
 char *getenv(const char *n) { (void)n; return NULL; }
 
+// ------------------------------------------------- rdtsc-based clock
+// Every HC_NOW is an MMIO VM exit (~us). The TSC is invariant on modern
+// parts, so calibrate it once at boot against two HC_NOW reads ~tens of ms
+// apart, then serve time locally. Re-sync through a hypercall every ~4s of
+// wall time to bound calibration drift. Only feeds wall-clock deadlines
+// (turn timeouts) and diagnostics — match semantics run on metered points.
+
+static inline uint64_t rd_tsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return lo | ((uint64_t)hi << 32);
+}
+
+static uint64_t tsc_base_tsc, tsc_base_ns;
+static double tsc_hz;
+static uint64_t last_sync_ns;
+
+static void clock_calibrate(void) {
+    uint64_t n0 = hcall(HC_NOW, 0, 0, 0, 0);
+    uint64_t t0 = rd_tsc();
+    volatile uint64_t acc = 0;               // ~25-40ms dependent ALU chain:
+    for (uint64_t i = 0; i < 15000000; i++) acc += i * 2654435761u;
+    uint64_t t1 = rd_tsc();
+    uint64_t n1 = hcall(HC_NOW, 0, 0, 0, 0);
+    (void)acc;
+    if (n1 <= n0 || t1 <= t0) { tsc_hz = 2e9; }   // degenerate: assume 2GHz
+    else tsc_hz = (double)(t1 - t0) * 1e9 / (double)(n1 - n0);
+    tsc_base_tsc = t1; tsc_base_ns = n1; last_sync_ns = n1;
+}
+
+uint64_t guest_now(void) {
+    uint64_t t = rd_tsc();
+    uint64_t est = tsc_base_ns
+        + (uint64_t)((double)(t - tsc_base_tsc) * 1e9 / tsc_hz);
+    if (est - last_sync_ns > 4000000000ull) {  // ~4s: bound clock drift
+        uint64_t n = hcall(HC_NOW, 0, 0, 0, 0);
+        tsc_base_tsc = t; tsc_base_ns = n; last_sync_ns = n;
+        est = n;
+    }
+    return est;
+}
+
 int clock_gettime(int clk, struct timespec *ts) {
-    uint64_t ns = hcall(HC_NOW, 0, 0, 0, 0);
+    uint64_t ns = guest_now();
     ts->tv_sec = ns / 1000000000ull;
     ts->tv_nsec = ns % 1000000000ull;
     return 0;
@@ -1058,6 +1101,7 @@ void guest_boot(void) {
     phys_next = heap_end;                 // phys pool takes from the top down
     heap_lo = heap_next; heap_hi = heap_end;
     arena_va_next = ARENA_VA;
+    clock_calibrate();
     hcall(HC_PROF, (uint64_t)prof_hist, sizeof prof_hist, 0, 0);
     if (BOOT->debug == 998) {
         // mem function self-test inside the guest

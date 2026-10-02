@@ -90,7 +90,26 @@ WABT_BIN = _wabt_bin()
 WASM_RT_DIR = HERE / "wasm-rt"  # vendored wasm-rt (patched: exn depth fix)
 WABT_INC = WASM_RT_DIR          # generated code only needs wasm-rt headers
 CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "kvmrun"
-CLANG = "clang"
+CLANG = os.environ.get("KVMRUN_CC", "clang")
+
+
+_TOOLVERS: str | None = None
+
+
+def tool_versions() -> str:
+    """Cache-busting identity of every tool that shapes generated artifacts:
+    wasm2c + clang versions, unatomic.py source, unswbc metering source."""
+    global _TOOLVERS
+    if _TOOLVERS is None:
+        wv = subprocess.run([str(WABT_BIN / "wasm2c"), "--version"],
+                            capture_output=True, text=True).stdout.strip()
+        cv = subprocess.run([CLANG, "--version"], capture_output=True,
+                            text=True).stdout.splitlines()[0].strip()
+        src = hashlib.sha256(
+            (HERE / "unatomic.py").read_bytes()
+            + pathlib.Path(metering.__file__).read_bytes()).hexdigest()[:16]
+        _TOOLVERS = f"{wv}|{cv}|{src}"
+    return _TOOLVERS
 
 
 def sh(cmd, **kw):
@@ -122,7 +141,8 @@ def bot_wasm(arg: str) -> pathlib.Path:
 
 
 def engine_c() -> pathlib.Path:
-    key = "engine-" + hashlib.sha256(ENGINE_WASM.read_bytes()).hexdigest()[:24]
+    key = "engine-" + hashlib.sha256(
+        ENGINE_WASM.read_bytes() + tool_versions().encode()).hexdigest()[:24]
     d = cache_dir(key)
     if not (d / "engine.c").is_file():
         tmp = pathlib.Path(tempfile.mkdtemp(prefix=d.name + ".", dir=d.parent))
@@ -139,7 +159,8 @@ def engine_c() -> pathlib.Path:
 def bot_c(wasm: pathlib.Path, mod: str) -> pathlib.Path:
     """wasm -> metered -> unatomic -> wasm2c; returns dir with {mod}.c/.h"""
     blob = wasm.read_bytes()
-    key = f"{mod}-" + hashlib.sha256(blob).hexdigest()[:24]
+    key = f"{mod}-" + hashlib.sha256(
+        blob + tool_versions().encode()).hexdigest()[:24]
     d = cache_dir(key)
     if not (d / f"{mod}.c").is_file():
         if metering.REMAINING not in blob:
@@ -200,7 +221,8 @@ def compile_obj(cdir: pathlib.Path, mod: str, extra_inc: pathlib.Path,
     if os.environ.get("KVMRUN_PROF"):
         flags += ["-finstrument-functions"]
     opt = os.environ.get("KVMRUN_OPT", "-O2")
-    tag = hashlib.sha256((opt + " -march=native ").encode() +
+    tag = hashlib.sha256(tool_versions().encode() +
+                         (opt + " -march=native ").encode() +
                          " ".join(flags).encode() +
                          (WASM_RT_DIR / "wasm-rt.h").read_bytes() +
                          (WASM_RT_DIR / "wasm-rt-exceptions.h").read_bytes()
@@ -267,7 +289,8 @@ def runner_key(backend: str, link_objs: list[pathlib.Path],
 def vmm_bin() -> pathlib.Path:
     vmm = cache_dir("vmm-" + hashlib.sha256(
         (HERE / "vmm.c").read_bytes() +
-        (HERE / "abi.h").read_bytes()).hexdigest()[:16]) / "vmm"
+        (HERE / "abi.h").read_bytes() +
+        tool_versions().encode()).hexdigest()[:16]) / "vmm"
     if not vmm.is_file():
         tmp = _tmp_for(vmm)
         try:

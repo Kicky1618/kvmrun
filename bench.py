@@ -172,8 +172,8 @@ def main() -> int:
                               replay=replay, env=env0)
                 runs.append(r)
                 ins = r["insns"] or {}
-                extra = (f" insns/turn A.p50={ins['A']['p50']:.1f}M"
-                         f" B.p50={ins['B']['p50']:.1f}M"
+                extra = (f" insns/turn A.p50={ins['A']['p50'] / 1e6:.1f}M"
+                         f" B.p50={ins['B']['p50'] / 1e6:.1f}M"
                          if "A" in ins and "B" in ins else "")
                 print(f"[{be} seed={seed} run{i}] {r['result']} "
                       f"match={r['match_s']}s wall={r['wall_s']}s "

@@ -793,11 +793,12 @@ struct Runner {
     w2c_engine eng;
     struct w2c_unswbc unswbc_i;
     struct w2c_wasi__snapshot__preview1 eng_wasi;
-    Bot **live; int nliving, live_cap;   // every spawn ever (lookup by id)
+    Bot **live; int nliving, live_cap;   // every spawn ever
+    Bot **bot_at;                        // indexed by dragon id (O(1) lookup)
     uint8_t *long_reply; size_t long_len;
     uint8_t *team_of; int team_cap;      // indexed by dragon id
-    uint64_t *pts[2]; size_t npts[2];   // per-team per-turn points
-    uint64_t *ins[2]; size_t nins[2];   // per-team per-turn wasm insns
+    uint64_t *pts[2]; size_t npts[2], pts_cap[2];   // per-team per-turn
+    uint64_t *ins[2]; size_t nins[2], ins_cap[2];   // per-turn wasm insns
     double t_start;
 };
 
@@ -807,6 +808,15 @@ static volatile bool eng_exit_armed;
 static int u64cmpv(const void *pa, const void *pb);
 static void stat_line(const char *who, const char *what,
                       uint64_t *a, size_t n);
+
+// amortized append (realloc-per-entry was O(turns^2) on long matches)
+static void stat_push(uint64_t **a, size_t *n, size_t *cap, uint64_t v) {
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 512;
+        *a = realloc(*a, *cap * sizeof **a);
+    }
+    (*a)[(*n)++] = v;
+}
 
 static wasm_rt_memory_t *eng_mem(void) { return w2c_engine_memory(&G.eng); }
 
@@ -874,9 +884,7 @@ u32 w2c_unswbc_bot_reply(struct w2c_unswbc *u, u32 dragon, u32 ptr, u32 len,
     }
     uint8_t *block = malloc(len ? len : 1);
     eng_rd(ptr, block, len);
-    Bot *b = NULL;
-    for (int i = 0; i < G.nliving; i++)
-        if (G.live[i]->dragon == (int)dragon) { b = G.live[i]; break; }
+    Bot *b = (dragon < (u32)G.team_cap) ? G.bot_at[dragon] : NULL;
     if (!b) { free(block); return 0; }
     unsigned round = 0;
     if (len > 6 && !memcmp(block, "ROUND ", 6))
@@ -887,13 +895,11 @@ u32 w2c_unswbc_bot_reply(struct w2c_unswbc *u, u32 dragon, u32 ptr, u32 len,
     free(block);
     if (b->live_pts) {
         int ti = b->team == 'b';
-        G.pts[ti] = realloc(G.pts[ti], (G.npts[ti] + 1) * sizeof(uint64_t));
-        G.pts[ti][G.npts[ti]++] = b->live_pts;
+        stat_push(&G.pts[ti], &G.npts[ti], &G.pts_cap[ti], b->live_pts);
     }
     if (b->live_ins) {
         int ti = b->team == 'b';
-        G.ins[ti] = realloc(G.ins[ti], (G.nins[ti] + 1) * sizeof(uint64_t));
-        G.ins[ti][G.nins[ti]++] = b->live_ins;
+        stat_push(&G.ins[ti], &G.nins[ti], &G.ins_cap[ti], b->live_ins);
     }
     if (b->failure[0])
         fprintf(stderr, "round %u: bot %u (team %c) %s\n",
@@ -920,13 +926,12 @@ void w2c_unswbc_log(struct w2c_unswbc *u, u32 dragon, u32 round, u32 reason) {
             round, dragon,
             toupper(dragon < G.team_cap ? G.team_of[dragon] : '?'),
             r && R[(uint8_t)r] ? R[(uint8_t)r] : "died");
-    for (int i = 0; i < G.nliving; i++)
-        if (G.live[i]->dragon == (int)dragon) {
-            Bot *b = G.live[i];
-            bot_frozen_set(b, 1);
-            pipe_close(&b->in);
-            pipe_close(&b->out);
-        }
+    Bot *b = (dragon < (u32)G.team_cap) ? G.bot_at[dragon] : NULL;
+    if (b) {
+        bot_frozen_set(b, 1);
+        pipe_close(&b->in);
+        pipe_close(&b->out);
+    }
 }
 
 // ---------------------------------------------------------------- thread
@@ -1034,14 +1039,17 @@ static void bot_spawn(int dragon, const uint8_t *init, size_t init_len) {
     }
     if (b->icount) b->icount_prev = *b->icount;
 
-    if ((int)dragon >= G.team_cap) {
-        int nc = G.team_cap * 2 + 1024;
-        while ((int)dragon >= nc) nc *= 2;
+    if ((size_t)dragon >= (size_t)G.team_cap) {
+        size_t nc = (size_t)G.team_cap * 2 + 1024;
+        while ((size_t)dragon >= nc) nc *= 2;
         G.team_of = realloc(G.team_of, nc);
         memset(G.team_of + G.team_cap, 0, nc - G.team_cap);
+        G.bot_at = realloc(G.bot_at, nc * sizeof(Bot *));
+        memset(G.bot_at + G.team_cap, 0, (nc - G.team_cap) * sizeof(Bot *));
         G.team_cap = nc;
     }
     G.team_of[dragon] = team;
+    G.bot_at[dragon] = b;
     if (G.nliving == G.live_cap) {
         G.live_cap = G.live_cap * 2 + 256;
         G.live = realloc(G.live, G.live_cap * sizeof(Bot *));

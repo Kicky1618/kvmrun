@@ -20,6 +20,7 @@ import glob
 import importlib.util
 import os
 import pathlib
+import platform
 import re
 import shutil
 import subprocess
@@ -230,6 +231,28 @@ def icount_enabled() -> bool:
     return os.environ.get("KVMRUN_ICOUNT", "") not in ("", "0")
 
 
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def native_march() -> list[str]:
+    """-march=native where supported; Apple Silicon clang wants -mcpu."""
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return ["-march=native"]
+    if m in ("arm64", "aarch64"):
+        return ["-mcpu=native"]
+    return []
+
+
+def link_or_copy(link: pathlib.Path, target: pathlib.Path) -> None:
+    """symlink header into the work dir; fall back to a copy on platforms
+    where symlinks need privileges (Windows without developer mode)."""
+    try:
+        link.symlink_to(target)
+    except OSError:
+        shutil.copy(target, link)
+
+
 GUEST_CFLAGS = [
     "-DKVMRUN_GUEST", "-ffreestanding", "-fno-stack-protector", "-fno-pic",
     "-mno-red-zone", "-nostdinc",
@@ -266,7 +289,7 @@ def compile_obj(cdir: pathlib.Path, mod: str, extra_inc: pathlib.Path,
         flags += ["-finstrument-functions"]
     opt = os.environ.get("KVMRUN_OPT", "-O2")
     tag = hashlib.sha256(tool_versions().encode() +
-                         (opt + " -march=native ").encode() +
+                         (opt + " " + " ".join(native_march())).encode() +
                          " ".join(flags).encode() +
                          (WASM_RT_DIR / "wasm-rt.h").read_bytes() +
                          (WASM_RT_DIR / "wasm-rt-exceptions.h").read_bytes()
@@ -275,7 +298,7 @@ def compile_obj(cdir: pathlib.Path, mod: str, extra_inc: pathlib.Path,
     if not obj.is_file():
         tmp = _tmp_for(obj)
         try:
-            sh([CLANG, opt, "-march=native", "-c", *flags, f"-I{WABT_INC}",
+            sh([CLANG, opt, *native_march(), "-c", *flags, f"-I{WABT_INC}",
                 f"-I{WASM_RT_DIR}",
                 f"-I{cdir}", f"-I{extra_inc}", "-o", str(tmp),
                 str(cdir / f"{mod}.c")])
@@ -363,12 +386,12 @@ def build(backend: str, arg_a: str, arg_b: str):
         d = bot_c(wasm, mod)
         mod_dirs[mod] = d
         # make headers importable as <mod>.h
-        (work / f"{mod}.h").symlink_to(d / f"{mod}.h")
+        link_or_copy(work / f"{mod}.h", d / f"{mod}.h")
         return compile_obj(d, mod, work, guest=backend == "kvm")
 
     guest = backend == "kvm"
     objs = [] if guest else [compile_obj(eng_dir, "engine", work)]
-    (work / "engine.h").symlink_to(eng_dir / "engine.h")
+    link_or_copy(work / "engine.h", eng_dir / "engine.h")
 
     ths = []
     errs: list[BaseException] = []
@@ -596,6 +619,15 @@ def main() -> int:
 
     if backend not in ("native", "kvm"):
         print(f"unknown backend {backend!r}", file=sys.stderr)
+        return 2
+    if os.name == "nt":
+        print("kvmrun: Windows is unsupported (host.c needs pthreads); "
+              "use WSL2 or Linux/macOS", file=sys.stderr)
+        return 2
+    if backend == "kvm" and not (
+            IS_LINUX and os.access("/dev/kvm", os.R_OK | os.W_OK)):
+        print("kvmrun: the kvm backend needs Linux with usable /dev/kvm",
+              file=sys.stderr)
         return 2
 
     if batch_file is not None:

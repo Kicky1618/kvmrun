@@ -30,7 +30,7 @@ source dir --(unswbc clangtool)--> bot.wasm
 bot.wasm --(metering, if absent)--> metered.wasm
 metered.wasm --(unatomic.py)--> lowered.wasm   # threads/atomics -> single-threaded
 lowered.wasm --(wasm2c -n bota|botb --enable-exceptions)--> bot.c/.h
-bot.c --(clang -O2 -march=native)--> bot.o
+bot.c --(clang -O2 -march=native / -mcpu=native on arm64)--> bot.o
 engine.wasm --(wasm2c -n engine)--> engine.c --(clang)--> engine.o
 ```
 
@@ -101,8 +101,9 @@ unresolved.
 
 ## Requirements
 
-- Linux, Python 3
-- `clang` and `ld`
+- Linux (tested) or macOS (`native` backend — untested in CI), Python 3.
+  Windows is not supported (`host.c` uses pthreads); use WSL2.
+- `clang`; on Linux also `ld` (guest ELF link for the `kvm` backend)
 - [wabt](https://github.com/WebAssembly/wabt) (`wasm2c` with
   `--enable-exceptions`)
 - [simde](https://github.com/simd-everywhere/simde) headers — wasm2c emits
@@ -112,7 +113,8 @@ unresolved.
 - the `unswbc` package (the judge toolchain, engine wasm, and metering pass):
   `uv tool install unswbc` — auto-detected from the `unswbc` console script's
   venv, an importable install, or `~/.local/share/uv/tools/unswbc`
-- `/dev/kvm` access for the `kvm` backend only
+- `/dev/kvm` access for the `kvm` backend only (Linux; refused early on
+  other platforms)
 
 ### Environment overrides
 

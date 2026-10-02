@@ -22,7 +22,7 @@
 //               [--debug N] [--no-replay] [-v]
 #include <mach/mach_time.h>
 #include <sys/mman.h>
-#include <Hypervisor/hv.h>
+#include <Hypervisor/Hypervisor.h>
 
 #include "vmm_common.h"
 

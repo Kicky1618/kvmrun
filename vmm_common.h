@@ -38,6 +38,9 @@
 static void    *hva(uint64_t gpa);
 static uint8_t *gptr(uint64_t gpa, uint64_t n);
 static int      spawn_vcpu(uint64_t entry, uint64_t stack_top, uint64_t arg);
+// host-commit a GPA range before VMM-side writes (KVM: no-op, RAM is
+// fully committed up front; WHPX/Hypervisor.framework commit chunks)
+static int      vmm_commit(uint64_t gpa, uint64_t len);
 
 static void die(const char *m) { perror(m); exit(2); }
 
@@ -47,9 +50,30 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+// Park `cv` until a monotonic ns deadline. Darwin has no
+// pthread_condattr_setclock — pthread_cond_timedwait waits on
+// CLOCK_REALTIME there — so use the _relative_np variant instead.
+static int cond_wait_deadline(pthread_cond_t *cv, pthread_mutex_t *mu,
+                              uint64_t dl_ns) {
+#ifdef __APPLE__
+    uint64_t now = now_ns();
+    struct timespec rel = {0, 1000};          // past deadline: 1ns ~= now
+    if (dl_ns > now) {
+        uint64_t d = dl_ns - now;
+        rel.tv_sec = (time_t)(d / 1000000000ull);
+        rel.tv_nsec = (long)(d % 1000000000ull);
+    }
+    return pthread_cond_timedwait_relative_np(cv, mu, &rel);
+#else
+    struct timespec ts = { (time_t)(dl_ns / 1000000000ull),
+                           (long)(dl_ns % 1000000000ull) };
+    return pthread_cond_timedwait(cv, mu, &ts);
+#endif
+}
+
 // ------------------------------------------------------------------ vcpus
 
-#define MAX_VCPU (MBX_ARENA_BYTES / MBX_SIZE)
+#define MAX_VCPU ((int)(MBX_ARENA_BYTES / MBX_SIZE))
 
 typedef struct Vcpu {
     pthread_t th;
@@ -72,6 +96,11 @@ typedef struct Vcpu {
     int fd;
     struct kvm_run *run;
     size_t runsz;
+#elif defined(__APPLE__)
+    hv_vcpu_t hv;
+    hv_vcpu_exit_t *ex;
+    uint64_t entry, arg;      // saved for in-thread hv_vcpu_create
+    volatile int ready;       // set once hv_vcpu_create + regs are done
 #endif
 } Vcpu;
 
@@ -225,10 +254,8 @@ static void futex_wait(Vcpu *v, struct hcall *m) {
         return;
     }
     v->woke_at = 0;
-    struct timespec ts = { deadline / 1000000000ull,
-                           deadline % 1000000000ull };
     for (;;) {
-        int r = deadline ? pthread_cond_timedwait(&v->cv, &v->mu, &ts)
+        int r = deadline ? cond_wait_deadline(&v->cv, &v->mu, deadline)
                          : (pthread_cond_wait(&v->cv, &v->mu), 0);
         // any non-zero return (timeout or error like EINVAL) ends the wait;
         // retrying on EINVAL would spin forever
@@ -447,6 +474,9 @@ static void dispatch(Vcpu *v, uint64_t mbx_gpa) {
 
 // ------------------------------------------------------------------ vm setup
 
+#if defined(__x86_64__) || defined(_M_X64)
+// x86-64 boot state: 4-level identity map + GDT/TSS. arm64 guests get the
+// equivalent descriptor-format tables from the driver's setup fn instead.
 static void setup_tables(void) {
     memset(hva(0x1000), 0, 0x3000);
     uint64_t *pml4 = hva(0x1000), *pdpt = hva(0x2000);
@@ -465,6 +495,7 @@ static void setup_tables(void) {
     gdt[4] = 0;
     memset(hva(0x8000), 0, 0x68);                  // tss body
 }
+#endif
 
 // ------------------------------------------------------------------ elf load
 
@@ -487,6 +518,11 @@ static void load_elf(void *mem, const char *path) {
     if (sz < 0x40 || memcmp(img, "\x7f""ELF", 4) || img[4] != 2 || img[5] != 1)
         elf_bad(path, "not a 64-bit LE ELF");
     if (img[6] != 1) elf_bad(path, "version");
+#ifdef __aarch64__
+    if (*(uint16_t *)(img + 18) != 183) elf_bad(path, "not an aarch64 ELF");
+#else
+    if (*(uint16_t *)(img + 18) != 62)  elf_bad(path, "not an x86-64 ELF");
+#endif
     uint64_t entry = *(uint64_t *)(img + 24);
     uint64_t phoff = *(uint64_t *)(img + 32);
     uint16_t phentsize = *(uint16_t *)(img + 54);
@@ -508,6 +544,7 @@ static void load_elf(void *mem, const char *path) {
             elf_bad(path, "segment data out of range");
         if (va >= RAM_BYTES || memsz > RAM_BYTES - va)
             elf_bad(path, "segment vaddr out of guest RAM");
+        if (vmm_commit(va, memsz)) elf_bad(path, "segment commit failed");
         memcpy((uint8_t *)mem + va, img + off, filesz);
         memset((uint8_t *)mem + va + filesz, 0, memsz - filesz);
     }
@@ -526,6 +563,7 @@ static int load_map_and_bootinfo(const char *elf) {
     long msz = ftell(mf);
     fseek(mf, 0, SEEK_SET);
     if (msz > (long)MAP_MAX) { fprintf(stderr, "vmm: map too big\n"); return -1; }
+    if (vmm_commit(MAP_GPA, (uint64_t)msz)) die("map commit");
     if (fread(hva(MAP_GPA), 1, msz, mf) != (size_t)msz) die("map");
     fclose(mf);
     struct bootinfo *bi = hva(BOOTINFO_GPA);

@@ -22,12 +22,20 @@ a single binary, and plays a whole match — roughly **50–100× faster** than
     Platform" feature or the Hyper-V role). WHPX memory exits carry no write
     data, so the MMIO doorbell's mailbox pointer is recovered by decoding the
     guest's store instruction; FS/GS-base MSRs are emulated in the VMM.
-  - **macOS** → not yet: Hypervisor.framework on Apple Silicon runs arm64
-    guests only, which needs an arm64 port of `guest/`.
+  - **macOS arm64** → `vmm_hv.c` over Hypervisor.framework (needs the
+    `com.apple.security.hypervisor` entitlement — `kvmrun.py` ad-hoc
+    signs the vmm binary). Apple Silicon runs arm64 guests only, so the
+    guest is ported to aarch64: `guest/entry_arm64.S` (entry, VBAR_EL1
+    vectors, ctx switch, setjmp), arm64 page-table descriptors via
+    `guest/arch.h` (TLS on TPIDR_EL0/EL1 plays the fs:0/fs:8 role), and
+    `guest/guest_arm64.ld`. The doorbell is a stage-2 abort — ESR SRT
+    names the stored register, so the mailbox GPA comes straight from
+    the vcpu register file with no instruction decode. Guest RAM is
+    demand-mapped in 2MiB chunks on stage-2 exits, like WHPX.
 
   The shared hypercall dispatch, futex parker, ELF loader, replay writer and
   stats live in `vmm_common.h` — guest-input validation is single-sourced
-  across both drivers.
+  across all three drivers.
 
 The VM backend exists to mirror the real judge's single-CPU contention model:
 all bot threads share one vCPU, so CPU-point accounting and wall-clock races
@@ -125,7 +133,9 @@ unresolved.
 - `clang` (clang-cl / mingw clang on Windows); on Linux also `ld`
   (guest ELF link). On Windows the guest ELF objects are cross-compiled
   with `-target x86_64-unknown-linux-gnu` and linked via `clang -fuse-ld=lld`
-  (llvm-mingw ships `ld.lld`)
+  (llvm-mingw ships `ld.lld`); on macOS arm64 the guest is
+  `-target aarch64-unknown-linux-gnu` and also needs `ld.lld`
+  (`brew install llvm` — Xcode's `ld` can't emit ELF)
 - [wabt](https://github.com/WebAssembly/wabt) `wasm2c`; exception support
   is required — kvmrun passes `--enable-exceptions` only when the binary
   advertises it (removed in newer wabt, where exceptions are always on)
@@ -138,9 +148,13 @@ unresolved.
 - the `unswbc` package (the judge toolchain, engine wasm, and metering pass):
   `uv tool install unswbc` — auto-detected from the `unswbc` console script's
   venv, an importable install, or `~/.local/share/uv/tools/unswbc`
-- for the `kvm` backend: usable `/dev/kvm` on Linux, or the Windows
-  Hypervisor Platform on Windows x64 (WHPX; refused early elsewhere —
-  macOS arm64 pending a guest port)
+- for the `kvm` backend: usable `/dev/kvm` on Linux, the Windows
+  Hypervisor Platform on Windows x64 (WHPX), or Hypervisor.framework on
+  macOS arm64 (the binary is ad-hoc signed with the
+  `com.apple.security.hypervisor` entitlement at build time; requires
+  macOS 11+ on Apple Silicon). The arm64 guest is compile-verified but
+  not yet runtime-verified on hardware — `--backend native` is the
+  proven path on macOS.
 
 ### Environment overrides
 

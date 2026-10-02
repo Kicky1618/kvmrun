@@ -33,6 +33,10 @@ static uint8_t *gptr(uint64_t gpa, uint64_t n) {
     }
     return (uint8_t *)gmem + gpa;
 }
+// guest RAM is fully committed up front (MAP_NORESERVE), nothing to do
+static int vmm_commit(uint64_t gpa, uint64_t len) {
+    (void)gpa; (void)len; return 0;
+}
 
 // ------------------------------------------------------------------ vcpus
 

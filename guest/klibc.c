@@ -12,21 +12,21 @@
 #include <time.h>
 #include <math.h>
 #include "../abi.h"
+#include "arch.h"
 
 // ---------------------------------------------------------------- hcalls
 
+// [tp+8] = mailbox GPA on both ISAs (fs:8 on x86, TPIDR_EL1 base on arm64)
 static inline struct hcall *mbx(void) {
-    uint64_t m;
-    __asm__ volatile("mov %%fs:8, %0" : "=r"(m));
-    return (struct hcall *)m;
+    return *(struct hcall **)(uintptr_t)(guest_tp() + 8);
 }
 
 uint64_t hcall(uint32_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     struct hcall *m = mbx();
     m->nr = nr; m->a = a; m->b = b; m->c = c; m->d = d;
-    __sync_synchronize();
+    mmio_fence();
     *(volatile uint64_t *)DOORBELL_GPA = (uint64_t)(uintptr_t)m;
-    __sync_synchronize();
+    mmio_fence();
     return m->ret;
 }
 
@@ -38,7 +38,7 @@ static void pflush(void);
 _Noreturn void hcall_exit(int code) {
     pflush();
     hcall(HC_EXIT, (uint64_t)code, 0, 0, 0);
-    for (;;) __asm__ volatile("hlt");
+    for (;;) cpu_halt();
 }
 
 // ---------------------------------------------------------------- TLS image
@@ -46,10 +46,8 @@ _Noreturn void hcall_exit(int code) {
 extern char __tls_start[], __tdata_end[], __tbss_end[];
 
 void tls_copy_to(uint64_t tp);
-static void tls_copy(void) {           // x86-64 TLS: vars live at [tp-size, tp)
-    uint64_t tp;
-    __asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
-    tls_copy_to(tp);
+static void tls_copy(void) {           // TLS vars live at [tp-size, tp)
+    tls_copy_to(guest_tp());
 }
 // fill a fresh TLS block for a cooperative thread: template in [tp-size,tp),
 // self pointer at tp+0, shared BSP mailbox at tp+8 (hcall() reads fs:8)
@@ -80,7 +78,7 @@ static void alock(volatile uint32_t *l) {
             if (__atomic_compare_exchange_n(l, &exp, 1, true,
                                             __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
                 return;
-            __asm__ volatile("pause");
+            cpu_relax();
         }
         __atomic_add_fetch(&alock_waiters, 1, __ATOMIC_ACQ_REL);
         g_futex_wait((uint32_t *)l, 1, 0);
@@ -126,7 +124,7 @@ static void blk_check(Blk *b, uint64_t where, void *arg) {
     if (ok) return;
     // report: a=99, b=bad block, c=site id, d=free() arg
     hcall(HC_GUESTFAULT, 99, (uint64_t)b, where, (uint64_t)arg);
-    for (;;) __asm__ volatile("hlt");
+    for (;;) cpu_halt();
 }
 
 static Blk *heap_tail;          // bump allocs always land at the tail
@@ -235,6 +233,7 @@ void *memcpy(void *d, const void *s, size_t n) {
         while (n--) *dd++ = *ss++;
         return d;
     }
+#ifdef __x86_64__
     if (n >= 4096) {                // rep movsb wins on big copies (FSRM)
         size_t cnt = n;
         __asm__ volatile("rep movsb"
@@ -262,6 +261,16 @@ void *memcpy(void *d, const void *s, size_t n) {
         : [s]"r"(ss), [d]"r"(dd), [n]"r"(n)
         : "rax", "ymm0", "ymm1", "memory");
     return d;
+#else
+    while (n >= 16) {
+        uint64_t a, b;
+        __builtin_memcpy(&a, ss, 8); __builtin_memcpy(&b, ss + 8, 8);
+        __builtin_memcpy(dd, &a, 8); __builtin_memcpy(dd + 8, &b, 8);
+        dd += 16; ss += 16; n -= 16;
+    }
+    while (n--) *dd++ = *ss++;
+    return d;
+#endif
 }
 void *memmove(void *d, const void *s, size_t n) {
     mm_bytes += n;
@@ -270,15 +279,21 @@ void *memmove(void *d, const void *s, size_t n) {
         // forward direction: memcpy only when disjoint (its head/tail order
         // is unsafe when ranges overlap)
         if ((uintptr_t)dd + n <= (uintptr_t)ss) return memcpy(d, s, n);
-        if (n >= 32) {              // rep movsb is strictly forward: safe
+        if (n >= 32) {              // strictly-forward bulk copy: safe
+#ifdef __x86_64__
             size_t cnt = n;
             __asm__ volatile("rep movsb"
                              : "+D"(dd), "+S"(ss), "+c"(cnt) :: "memory");
             return d;
+#else
+            while (n--) *dd++ = *ss++;
+            return d;
+#endif
         }
         while (n--) *dd++ = *ss++;
         return d;
     }
+#ifdef __x86_64__
     if (n >= 256) {                 // backward copy for overlap
         uint8_t *bd = dd + n - 1;
         const uint8_t *bs = ss + n - 1;
@@ -287,18 +302,21 @@ void *memmove(void *d, const void *s, size_t n) {
                          : "+D"(bd), "+S"(bs), "+c"(cnt) :: "memory");
         return d;
     }
+#endif
     dd += n; ss += n;
     while (n--) *--dd = *--ss;
     return d;
 }
 void *memset(void *d, int c, size_t n) {
     ms_bytes += n;
+#ifdef __x86_64__
     if (n >= 256) {
         uint8_t *dd = d; size_t cnt = n;
         __asm__ volatile("rep stosb"
                          : "+D"(dd), "+c"(cnt) : "a"((uint8_t)c) : "memory");
         return d;
     }
+#endif
     uint8_t *dd = d;
     while (((uintptr_t)dd & 7) && n) { *dd++ = (uint8_t)c; n--; }
     uint64_t v = 0x0101010101010101ull * (uint8_t)c;
@@ -503,7 +521,10 @@ FILE *stderr = &__sf_err;
 // ---------------------------------------------------------------- misc
 
 // ------------------------------------------------------------------ IDT
+// x86 only. On aarch64, _start presets VBAR_EL1/SP_EL1 and all sync
+// exceptions land in the vector table in entry_arm64.S — nothing to do.
 
+#ifndef __aarch64__
 struct idt_ent {
     uint16_t lo, sel;
     uint8_t ist, type;
@@ -530,6 +551,10 @@ void idt_load(void) {                    // per-vCPU
         { sizeof g_idt - 1, (uint64_t)g_idt };
     __asm__ volatile("lidt %0" :: "m"(d));
 }
+#else
+void idt_load(void) { }
+#endif
+#ifndef __aarch64__
 static void idt_init(void) {
     ist_init();
     for (int i = 0; i < 32; i++) {
@@ -541,6 +566,9 @@ static void idt_init(void) {
             .mid = (a >> 16) & 0xffff, .hi = (uint32_t)(a >> 32), .zero = 0};
     }
 }
+#else
+static void idt_init(void) { }
+#endif
 
 // ---------------------------------------------------- wasm memory arena
 // wasm-rt guard-pages mode reserves 8GiB per wasm memory (4GiB usable +
@@ -641,19 +669,19 @@ static uint64_t *arena_pd(uint64_t va, int create) {
             ? ARENA_PDPT_POOL + (i4 - ARENA_PML4_LO) * 4096
             : phys_page();                       // stack window et al.
         if (!pa) return NULL;
-        pml4[i4] = pa | 3;
+        pml4[i4] = pa | PT_TBL;
     }
     uint64_t *pdpt = (uint64_t *)(pml4[i4] & ~4095ull);
     if (!(pdpt[i3] & 1)) {
         if (!create) return NULL;
         uint64_t pa = phys_page();
         if (!pa) return NULL;
-        pdpt[i3] = pa | 3;
+        pdpt[i3] = pa | PT_TBL;
     }
     return (uint64_t *)(pdpt[i3] & ~4095ull);
 }
 
-#define PTE_PS 0x80ull      // large page (2MiB at PD level)
+// leaf/table/2MiB descriptor encodings live in arch.h (PT_LEAF2M etc.)
 
 static void arena_unmap_range(uint64_t va, uint64_t len) {
     uint64_t end = va + len;
@@ -663,10 +691,9 @@ static void arena_unmap_range(uint64_t va, uint64_t len) {
         uint64_t i2 = (slot >> 21) & 511;
         uint64_t e = pd[i2];
         if (!(e & 1)) continue;
-        if (e & PTE_PS) {                          // whole 2MiB leaf
+        if (PTE_IS_2M(e)) {                        // whole 2MiB leaf
             pd[i2] = 0;
-            __asm__ volatile("invlpg %0" :: "m"(*(volatile char *)slot)
-                             : "memory");
+            tlb_inval_page(slot);
             free_push2m(e & ~0x1fffffull);
             continue;
         }
@@ -678,14 +705,12 @@ static void arena_unmap_range(uint64_t va, uint64_t len) {
             if (a < va || a >= end) { empty = false; continue; }
             uint64_t pa = pt[i1] & ~4095ull;
             pt[i1] = 0;
-            __asm__ volatile("invlpg %0" :: "m"(*(volatile char *)a)
-                             : "memory");
+            tlb_inval_page(a);
             free_push(pa);
         }
         if (empty) {                               // all leaves gone
             pd[i2] = 0;
-            __asm__ volatile("invlpg %0" :: "m"(*(volatile char *)slot)
-                             : "memory");
+            tlb_inval_page(slot);
             free_push((uint64_t)(uintptr_t)pt);
         }
     }
@@ -726,24 +751,24 @@ int kvm_guest_mprotect(void *addr, size_t len) {
         // fully-covered, aligned, still-empty 2MiB slot -> large page
         if (!(p & 0x1fffff) && p + 0x200000 <= end && !(pd[i2] & 1)) {
             uint64_t pa = phys_page2m();
-            if (pa) { pd[i2] = pa | PTE_PS | 3; p += 0x200000; continue; }
+            if (pa) { pd[i2] = pa | PT_LEAF2M; p += 0x200000; continue; }
             // fall through to 4KiB if the phys pool is out of 2MiB room
         }
-        if (pd[i2] & PTE_PS) {                    // already inside a large page
+        if ((pd[i2] & 1) && PTE_IS_2M(pd[i2])) {   // already in a large page
             p = (p & ~0x1fffffull) + 0x200000;
             continue;
         }
         if (!(pd[i2] & 1)) {
             uint64_t pa = phys_page();
             if (!pa) return -1;
-            pd[i2] = pa | 3;
+            pd[i2] = pa | PT_TBL;
         }
         uint64_t *pt = (uint64_t *)(pd[i2] & ~4095ull);
         uint64_t i1 = (p >> 12) & 511;
         if (!(pt[i1] & 1)) {
             uint64_t pa = phys_page();
             if (!pa) return -1;
-            pt[i1] = pa | 3;
+            pt[i1] = pa | PT_LEAF;
         }
         p += 4096;
     }
@@ -830,15 +855,15 @@ static int stk_fault_commit(uint64_t cr2) {
     if (!(pd[i2] & 1)) {
         uint64_t pa = phys_page();
         if (!pa) return -1;
-        pd[i2] = pa | 3;
+        pd[i2] = pa | PT_TBL;
     }
     uint64_t *pt = (uint64_t *)(pd[i2] & ~4095ull);
     uint64_t i1 = (a >> 12) & 511;
     if (!(pt[i1] & 1)) {
         uint64_t pa = phys_page();
         if (!pa) return -1;
-        pt[i1] = pa | 3;
-        __asm__ volatile("invlpg %0" :: "m"(*(volatile char *)a) : "memory");
+        pt[i1] = pa | PT_LEAF;
+        tlb_inval_page(a);
     }
     return 1;
 }
@@ -848,7 +873,12 @@ void wasm_rt_trap(int code);        // WASM_RT_TRAP_OOB == 1
 
 void exc_report(uint64_t vec, uint64_t err, uint64_t rip, uint64_t cr2,
                 uint64_t frame) {
-    if (vec == 14) {
+#ifdef __aarch64__
+    const int pf = (vec == 0x24 || vec == 0x20);   // data/insn abort, cur EL
+#else
+    const int pf = (vec == 14);
+#endif
+    if (pf) {
         // #PF on a live demand-paged stack reservation: commit and resume.
         if (stk_fault_commit(cr2) > 0) return;
         // #PF inside a wasm reservation's guard region == WASM OOB access:
@@ -878,11 +908,8 @@ char *getenv(const char *n) { (void)n; return NULL; }
 // wall time to bound calibration drift. Only feeds wall-clock deadlines
 // (turn timeouts) and diagnostics — match semantics run on metered points.
 
-static inline uint64_t rd_tsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return lo | ((uint64_t)hi << 32);
-}
+// monotonic counter; Hz is calibrated below either way (cntvct on arm64)
+static inline uint64_t rd_tsc(void) { return rd_cycles(); }
 
 static uint64_t tsc_base_tsc, tsc_base_ns;
 static double tsc_hz;
@@ -1000,8 +1027,13 @@ double fmin(double a, double b) { return a != a ? b : b != b ? a : a < b ? a : b
 double fmax(double a, double b) { return a != a ? b : b != b ? a : a > b ? a : b; }
 float fminf(float a, float b) { return a != a ? b : b != b ? a : a < b ? a : b; }
 float fmaxf(float a, float b) { return a != a ? b : b != b ? a : a > b ? a : b; }
+#ifdef __aarch64__
+double sqrt(double x) { double r; __asm__("fsqrt %d0, %d1" : "=w"(r) : "w"(x)); return r; }
+float sqrtf(float x) { float r; __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(x)); return r; }
+#else
 double sqrt(double x) { double r; __asm__("sqrtsd %1, %0" : "=x"(r) : "x"(x)); return r; }
 float sqrtf(float x) { float r; __asm__("sqrtss %1, %0" : "=x"(r) : "x"(x)); return r; }
+#endif
 double copysign(double x, double y) { return __builtin_copysign(x, y); }
 float copysignf(float x, float y) { return __builtin_copysignf(x, y); }
 // round-half-even via the 2^52 add/sub trick

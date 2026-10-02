@@ -116,6 +116,10 @@ static int range_mapped(uint64_t gpa, uint64_t len) {
 }
 
 // VMM-side write path: commits on demand so setup/ELF/map writes land.
+static int vmm_commit(uint64_t gpa, uint64_t len) {
+    if (gpa >= RAM_BYTES) return -1;
+    return commit_range(gpa, len);
+}
 static void *hva(uint64_t gpa) {
     if (gpa >= RAM_BYTES) return NULL;
     if (commit_range(gpa, 1)) return NULL;

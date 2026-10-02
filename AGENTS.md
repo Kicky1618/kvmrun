@@ -29,11 +29,14 @@
 - `kvm` backend: single BSP vCPU, cooperative in-guest contexts
   (`guest/gthr.c`); never add real parallel vCPUs for bots — the serial
   protocol is what reproduces the judge's CPU-point contention model.
-  The VM driver is per-platform: `vmm.c` (Linux `/dev/kvm`) and
-  `vmm_whpx.c` (Windows WHPX — WinHvPlatform.dll loaded dynamically).
+  The VM driver is per-platform: `vmm.c` (Linux `/dev/kvm`),
+  `vmm_whpx.c` (Windows WHPX — WinHvPlatform.dll loaded dynamically),
+  and `vmm_hv.c` (macOS arm64 Hypervisor.framework).
   Hypercall dispatch, futex parking, ELF load, replay writer and stats
   are single-sourced in `vmm_common.h` — do NOT duplicate that logic into
-  a driver; provide only the `hva`/`gptr`/`spawn_vcpu` hooks it declares.
+  a driver; provide only the `hva`/`gptr`/`spawn_vcpu`/`vmm_commit`
+  hooks it declares (`vmm_commit` host-commits a GPA range before
+  VMM-side writes — ELF/map loads use it; KVM's is a no-op).
   WHPX memory exits carry no write data, so `doorbell_data` decodes the
   guest's `mov [DOORBELL_GPA], reg` store to recover the mailbox GPA;
   FS/GS/KernelGS-base MSRs are emulated via the segment-register file.
@@ -43,8 +46,21 @@
   uncommitted VA. WHPX runtime is not yet hardware-verified — the
   exception-bitmap is left at 0 assuming unmapped vectors are delivered
   to the guest IDT (needed for the demand-paged stack #PF scheme).
-  macOS is gated off: Hypervisor.framework on arm64 needs an arm64 guest
-  port (entry.S, page tables, setjmp, ctx switch are all x86-specific).
+  On macOS arm64 the guest is aarch64 (`guest/entry_arm64.S`,
+  `guest/arch.h`, `guest/guest_arm64.ld`): HV only runs arm64 guests.
+  `gctx_switch` must save d8-d15 (callee-saved on aarch64, unlike x86
+  XMMs) — frame is 160B, x30 slot at +88 is the resume target.
+  The doorbell is a stage-2 abort — ESR.ISS.ISV+SRT names the stored
+  register so no instruction decode is needed (falls back fatal if ISV
+  is clear). Sysregs (TTBR0/TCR/MAIR/SCTLR+CPACR/SP_EL0) are preset per
+  vcpu; VBAR_EL1/SP_EL1/TPIDR_EL0+1 are guest-owned (`_start`/`tls_init`
+  set them). Guest RAM is a PROT_NONE reservation committed via
+  mmap-fixed + hv_vm_map on stage-2 aborts. hv_vcpu_create/run happen on
+  the vcpu thread itself (HV requires it). The binary needs the
+  com.apple.security.hypervisor entitlement — kvmrun.py ad-hoc signs.
+  NOT yet runtime-verified on hardware — compile-verified only.
+  Darwin has no pthread_condattr_setclock: vmm_common's
+  cond_wait_deadline uses pthread_cond_timedwait_relative_np there.
 - Demand-paged guest stacks (`stk_alloc`/`stk_free` in `klibc.c`) and TLS
   inside each stack block — thousands of live threads OOM with eager stacks.
 - Physical-frame recycling (`phys_free`/`phys2m_free`,
@@ -54,8 +70,9 @@
   have `deadline != 0` or sit on a wait queue — `wake_ctx` clears both.
 - `pthread_join` recycles gctx through `gpool`; the `in_z` flag owns the
   zombie-list membership — do not `free()` a gctx directly.
-- `guest_now()` is rdtsc-calibrated against `HC_NOW` and resyncs every ~4 s;
-  deadlines cross to the host as host `CLOCK_MONOTONIC` ns.
+- `guest_now()` is counter-calibrated against `HC_NOW` (rdtsc on x86,
+  `cntvct_el0` on aarch64) and resyncs every ~4 s; deadlines cross to the
+  host as host `CLOCK_MONOTONIC` ns.
 - wasm2c "segue" (`WASM_RT_ALLOW_SEGUE`) is enabled when the host has
   `fsgsbase`: generated code accesses linear memory through `%gs` set to the
   memory base at every exported call. In the guest this makes `gs` part of a

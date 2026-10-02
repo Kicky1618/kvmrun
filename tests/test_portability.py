@@ -71,10 +71,60 @@ assert "MSR_FS_BASE" in WHPX and "KernelGsBase" in WHPX, \
     "vmm_whpx.c must emulate fs/gs base MSRs"
 print("vmm_whpx: shared dispatch + doorbell decode + MSR emulation")
 
-# The Windows shim must cover every pthread symbol used by BOTH drivers
-vmm_used = set(re.findall(r"pthread_[a-z_]+", VMMC + WHPX + COMMON))
+# The Windows shim must cover every pthread symbol used by BOTH drivers.
+# *_np calls are Darwin-only (relative_np is inside #ifdef __APPLE__).
+vmm_used = {s for s in re.findall(r"pthread_[a-z_]+", VMMC + WHPX + COMMON)
+            if not s.endswith("_np")}
 missing = vmm_used - have
 assert not missing, f"win32 shim missing for vmm: {sorted(missing)}"
 print(f"pthread shim covers vmm APIs too ({len(vmm_used - used)} extra)")
+
+# ---- Hypervisor.framework driver + arm64 guest (macOS sandboxed backend) --
+HV = (ROOT / "vmm_hv.c").read_text()
+assert '#include "vmm_common.h"' in HV, "vmm_hv.c must share dispatch"
+assert "case HC_PRINT" not in HV, "hypercall switch must live only in vmm_common.h"
+for hook in ("hva", "gptr", "spawn_vcpu", "vmm_commit"):
+    assert re.search(rf"static .*{hook}\(", HV), f"vmm_hv.c: missing {hook}"
+for drv, src in (("vmm.c", VMMC), ("vmm_whpx.c", WHPX), ("vmm_hv.c", HV)):
+    assert re.search(r"static int vmm_commit\(", src), \
+        f"{drv}: missing vmm_commit hook"
+# doorbell on arm64 is a stage-2 abort: ESR SRT names the stored reg —
+# recover the mailbox GPA from the register file, never assume v->mbx
+assert "ISS_SRT" in HV and "HV_REG_X0 + srt" in HV, \
+    "vmm_hv.c must read the doorbell source register"
+assert "dispatch(v, v->mbx)" not in HV, "doorbell must not assume v->mbx"
+# demand mapping on stage-2 aborts + sysreg presets for the arm64 guest
+for req in ("hv_vm_map", "commit_range", "HV_SYS_REG_TTBR0_EL1",
+            "HV_SYS_REG_TCR_EL1", "HV_SYS_REG_SCTLR_EL1",
+            "HV_SYS_REG_CPACR_EL1", "HV_EXIT_REASON_EXCEPTION"):
+    assert req in HV, f"vmm_hv.c: missing {req}"
+print("vmm_hv: shared dispatch + SRT doorbell + sysreg preset")
+
+# arm64 guest pieces
+ARCH = (ROOT / "guest" / "arch.h").read_text()
+for req in ("guest_tp", "guest_set_tp", "cpu_halt", "rd_cycles",
+            "tlb_inval_page", "mmio_fence", "PT_TBL", "PT_LEAF",
+            "PT_LEAF2M", "PTE_IS_2M", "tpidr_el1", "cntvct_el0",
+            "MSR_FS_BASE" if False else "wrmsr"):
+    assert req in ARCH, f"arch.h: missing {req}"
+A64 = (ROOT / "guest" / "entry_arm64.S").read_text()
+for req in ("_start", "tls_init", "gctx_switch", "setjmp", "longjmp",
+            "vbar_el1", "sp_el1", "tpidr_el0", "eret", "exc_report",
+            "vectors_el1"):
+    assert req in A64.lower() or req in A64, f"entry_arm64.S: missing {req}"
+# d8-d15 are callee-saved on aarch64 (unlike x86 XMMs): the ctx switch
+# must carry them across gctx_switch or wasm2c FP code corrupts on yield
+assert "d8" in A64 and "d15" in A64 and "[sp, #144]" in A64, \
+    "gctx_switch: missing callee-saved d8-d15 save/restore"
+KLIBC = (ROOT / "guest" / "klibc.c").read_text()
+GTHR = (ROOT / "guest" / "gthr.c").read_text()
+assert "__aarch64__" in KLIBC and "__aarch64__" in GTHR, \
+    "guest C sources must carry aarch64 branches"
+SJ = (ROOT / "guest" / "include" / "setjmp.h").read_text()
+assert "__aarch64__" in SJ and "jmp_buf[24]" in SJ, \
+    "setjmp.h: missing aarch64 jmp_buf"
+LD64 = (ROOT / "guest" / "guest_arm64.ld").read_text()
+assert "aarch64" in LD64 and "_start" in LD64, "guest_arm64.ld bad"
+print("arm64 guest: entry/vectors/pages/setjmp all present")
 
 print("test_portability: OK")

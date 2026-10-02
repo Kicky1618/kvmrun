@@ -284,7 +284,15 @@ def icount_enabled() -> bool:
 
 IS_LINUX = sys.platform.startswith("linux")
 IS_WINDOWS = os.name == "nt"
+IS_MACOS = sys.platform == "darwin"
 EXE = ".exe" if IS_WINDOWS else ""
+# the sandboxed guest ISA: x86-64 for KVM/WHPX, aarch64 for HV.framework
+# (Apple Silicon hypervisors can only run arm64 guests)
+GUEST_ARM64 = IS_MACOS and platform.machine().lower() in ("arm64", "aarch64")
+GUEST_TARGET = ("aarch64-unknown-linux-gnu" if GUEST_ARM64
+                else "x86_64-unknown-linux-gnu")
+GUEST_ENTRY = "entry_arm64.S" if GUEST_ARM64 else "entry.S"
+GUEST_LD = "guest_arm64.ld" if GUEST_ARM64 else "guest.ld"
 
 
 def native_march() -> list[str]:
@@ -340,9 +348,11 @@ def guest_cflags() -> list[str]:
     fl = list(GUEST_CFLAGS)
     fl[fl.index(None)] = str(clang_res_inc())
     fl += simde_flags()
-    if IS_WINDOWS:
-        # the guest payload is freestanding x86-64 ELF regardless of host
-        fl += ["-target", "x86_64-unknown-linux-gnu"]
+    if IS_WINDOWS or IS_MACOS:
+        # the guest payload is a freestanding ELF regardless of host OS
+        fl += ["-target", GUEST_TARGET]
+    if GUEST_ARM64:
+        fl = [f for f in fl if f != "-mno-red-zone"]  # x86-only concept
     return fl
 
 
@@ -418,12 +428,10 @@ def runner_key(backend: str, link_objs: list[pathlib.Path],
             if f.is_file():
                 h.update(f.name.encode() + b"\0" + f.read_bytes())
     if backend == "kvm":
-        for rel in ("guest/guest.ld", "guest/klibc.c", "guest/gthr.c",
-                    "guest/entry.S"):
-            h.update(rel.encode() + b"\0" + (HERE / rel).read_bytes())
-        for f in sorted((HERE / "guest" / "include").rglob("*")):
+        for f in sorted((HERE / "guest").rglob("*")):
             if f.is_file():
-                h.update(f.read_bytes())
+                h.update(str(f.relative_to(HERE)).encode() + b"\0" +
+                         f.read_bytes())
     h.update(" ".join(native_flags()).encode())
     for k in ("KVMRUN_CFLAGS", "KVMRUN_OBJCFLAGS", "KVMRUN_OPT",
               "KVMRUN_DEPTHCOUNT", "KVMRUN_PROF"):
@@ -432,10 +440,13 @@ def runner_key(backend: str, link_objs: list[pathlib.Path],
 
 
 def vmm_bin() -> pathlib.Path:
-    # the sandboxed backend: KVM on Linux, WHPX on Windows — same guest
-    # ELF and ABI either way (vmm_common.h holds the shared dispatch)
+    # the sandboxed backend: KVM on Linux, WHPX on Windows,
+    # Hypervisor.framework on macOS arm64 — vmm_common.h holds the
+    # shared dispatch either way.
     if IS_WINDOWS:
         src, out = "vmm_whpx.c", "vmm.exe"
+    elif IS_MACOS:
+        src, out = "vmm_hv.c", "vmm"
     else:
         src, out = "vmm.c", "vmm"
     key = hashlib.sha256(
@@ -452,7 +463,27 @@ def vmm_bin() -> pathlib.Path:
         tmp = _tmp_for(vmm)
         try:
             sh([CLANG, "-O2", *native_flags(),
+                *(["-framework", "Hypervisor"] if IS_MACOS else []),
                 "-o", str(tmp), str(HERE / src)])
+            if IS_MACOS:
+                # hv_vm_create requires the hypervisor entitlement;
+                # ad-hoc sign it in (locally-run binary, no identity).
+                ent = vmm.parent / "hv.entitlements"
+                ent.write_text(
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<plist version="1.0"><dict>\n'
+                    '<key>com.apple.security.hypervisor</key><true/>\n'
+                    '</dict></plist>\n')
+                r = subprocess.run(
+                    ["codesign", "-s", "-", "--force",
+                     "--entitlements", str(ent), str(tmp)],
+                    capture_output=True)
+                if r.returncode:
+                    print("kvmrun: codesign failed — hv_vm_create will "
+                          "return HV_DENIED without the "
+                          "com.apple.security.hypervisor entitlement:\n"
+                          + r.stderr.decode(errors="replace"),
+                          file=sys.stderr)
             os.replace(tmp, vmm)
         finally:
             tmp.unlink(missing_ok=True)
@@ -563,24 +594,24 @@ def build(backend: str, arg_a: str, arg_b: str):
             gsup.append(out)
         ent = work / "entry.o"
         sh([CLANG, "-c",
-            *(["-target", "x86_64-unknown-linux-gnu"] if IS_WINDOWS else []),
+            *(["-target", GUEST_TARGET] if (IS_WINDOWS or IS_MACOS) else []),
             *(["-DWASM_RT_ALLOW_SEGUE=1"] if host_fsgsbase() else []),
-            "-o", str(ent), str(HERE / "guest" / "entry.S")])
+            "-o", str(ent), str(HERE / "guest" / GUEST_ENTRY)])
         ghost = work / "host.guest.o"
         sh([CLANG, "-O1", "-c", *guest_cflags(), f"-I{WABT_INC}",
             f"-I{WASM_RT_DIR}", f"-I{work}", f"-I{HERE}",
             "-o", str(ghost), str(HERE / "host.c")])
-        if IS_WINDOWS:
-            # mingw `ld` targets PE/COFF — drive the ELF link through
-            # clang -target instead (uses ld.lld from llvm-mingw/zig)
-            sh([CLANG, "-target", "x86_64-unknown-linux-gnu", "-nostdlib",
+        if IS_WINDOWS or IS_MACOS:
+            # host `ld` targets PE/COFF (mingw) or Mach-O (Xcode) — drive
+            # the ELF link through clang -target + ld.lld instead
+            sh([CLANG, "-target", GUEST_TARGET, "-nostdlib",
                 "-fuse-ld=lld",
-                "-Wl,-T," + str(HERE / "guest" / "guest.ld"),
+                "-Wl,-T," + str(HERE / "guest" / GUEST_LD),
                 "-Wl,--build-id=none",
                 "-o", str(bout), str(ent), *map(str, gsup), str(ghost),
                 *map(str, gobjs), *map(str, grt)])
         else:
-            sh(["ld", "-T", str(HERE / "guest" / "guest.ld"),
+            sh(["ld", "-T", str(HERE / "guest" / GUEST_LD),
                 "--build-id=none",
                 "-o", str(bout), str(ent), *map(str, gsup), str(ghost),
                 *map(str, gobjs), *map(str, grt)])
@@ -723,14 +754,15 @@ def main() -> int:
         print(f"unknown backend {backend!r}", file=sys.stderr)
         return 2
     if backend == "kvm":
-        # sandboxed VM: KVM on Linux, WHPX on Windows (same guest ABI).
-        # macOS has no x86-64 hypervisor backend yet (Hypervisor.framework
-        # on arm64 needs an arm64 guest port).
+        # sandboxed VM: /dev/kvm on Linux, WHPX on Windows,
+        # Hypervisor.framework on macOS arm64.
         ok = (IS_WINDOWS or
-              (IS_LINUX and os.access("/dev/kvm", os.R_OK | os.W_OK)))
+              (IS_LINUX and os.access("/dev/kvm", os.R_OK | os.W_OK)) or
+              GUEST_ARM64)
         if not ok:
-            print("kvmrun: the kvm backend needs usable /dev/kvm (Linux) or "
-                  "WHPX (Windows); use --backend native on this platform",
+            print("kvmrun: the kvm backend needs usable /dev/kvm (Linux), "
+                  "WHPX (Windows) or Hypervisor.framework (macOS arm64); "
+                  "use --backend native on this platform",
                   file=sys.stderr)
             return 2
 

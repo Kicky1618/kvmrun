@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include "../abi.h"
+#include "arch.h"
 
 uint64_t hcall(uint32_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 void kprint(int fd, const void *buf, uint64_t len);
@@ -203,7 +204,7 @@ static void block_cur(gctx **wq, volatile uint32_t *key, uint64_t deadline) {
 void sched_init(void) {
     if (cur) return;
     memset(&bsp_ctx, 0, sizeof bsp_ctx);
-    __asm__ volatile("mov %%fs:0, %0" : "=r"(bsp_ctx.tp));
+    bsp_ctx.tp = guest_tp();
     cur = &bsp_ctx;
 }
 
@@ -225,8 +226,14 @@ int pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *)
     if (tsize + 16 > TLS_RESERVE) { stk_free(base); free(g); return -1; }
     tls_copy_to(tp);                     // fills [tp-tsize, tp+16)
     uint64_t sp = (tp - TLS_RESERVE) & ~15ull;   // ≡0 mod 16
+    // fabricated callee-save frame that gctx_switch pops into gctx_run
+#ifdef __aarch64__
+    sp -= 160; memset((void *)sp, 0, 160);             // x19..x30,d8..d15 image
+    *(uint64_t *)(sp + 88) = (uint64_t)gctx_run;       // x30 slot = ret tgt
+#else
     sp -= 16; *(uint64_t *)sp = (uint64_t)gctx_run;    // ret slot ≡0 mod 16
     sp -= 48; memset((void *)sp, 0, 48);               // r15..rbp image
+#endif
     g->rsp = sp; g->tp = tp; g->stack = (uint8_t *)(uintptr_t)base;
     g->fn = fn; g->arg = arg;
     rq_put(g);
@@ -246,7 +253,7 @@ void gctx_run(void) {
     me->next = zombies; zombies = me;    // stack freed after we switch away
     me->in_z = 1;
     schedule();                          // switch out for good
-    for (;;) __asm__ volatile("hlt");
+    for (;;) cpu_halt();
 }
 
 int pthread_detach(pthread_t t) { (void)t; return 0; }

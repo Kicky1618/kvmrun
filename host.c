@@ -7,11 +7,20 @@
 // seeded xoshiro RNG, frozen gate between turns.
 //
 // KVMRUN_GUEST builds run freestanding inside the KVM guest (see guest/);
-// otherwise this links as a normal Linux binary.
+// otherwise this links as a normal host binary (Linux/macOS/Windows —
+// Windows resolves <pthread.h>/<unistd.h> via win32/include).
 #ifdef KVMRUN_GUEST
 #include "abi.h"
 #else
 #define _GNU_SOURCE
+#endif
+#if defined(_WIN32) && !defined(KVMRUN_GUEST)
+#define _CRT_RAND_S                      /* rand_s(): CSPRNG, no extra libs */
+#if defined(_MSC_VER) && !defined(__clang__)
+#error "Windows builds need clang (clang-cl or mingw clang), not cl"
+#endif
+#include <direct.h>
+#define mkdir(p, m) _mkdir(p)
 #endif
 #include <errno.h>
 #include <inttypes.h>
@@ -39,9 +48,14 @@
 
 // optional instruction counters, exported only when the module was built
 // with KVMRUN_ICOUNT=1 (absent symbols resolve to NULL)
-u64 *w2c_bota_kvmrun_icount(w2c_bota *inst) __attribute__((weak));
-u64 *w2c_botb_kvmrun_icount(w2c_botb *inst) __attribute__((weak));
-u64 *w2c_engine_kvmrun_icount(w2c_engine *inst) __attribute__((weak));
+#ifdef __GNUC__
+#define KVMRUN_WEAK __attribute__((weak))
+#else
+#define KVMRUN_WEAK
+#endif
+KVMRUN_WEAK u64 *w2c_bota_kvmrun_icount(w2c_bota *inst) { (void)inst; return 0; }
+KVMRUN_WEAK u64 *w2c_botb_kvmrun_icount(w2c_botb *inst) { (void)inst; return 0; }
+KVMRUN_WEAK u64 *w2c_engine_kvmrun_icount(w2c_engine *inst) { (void)inst; return 0; }
 
 #define MAX_TURN_POINTS 100000000LL
 #define MAX_MEMORY_PAGES 768
@@ -1024,8 +1038,7 @@ static void bot_spawn(int dragon, const uint8_t *init, size_t init_len) {
         wasm2c_bota_instantiate(b->ia, &b->env_i, &b->wasi_i, &b->wasix_i);
         b->meter = w2c_bota_wasmer_metering_remaining_points(b->ia);
         b->exh = w2c_bota_wasmer_metering_points_exhausted(b->ia);
-        if (w2c_bota_kvmrun_icount)
-            b->icount = w2c_bota_kvmrun_icount(b->ia);
+        b->icount = w2c_bota_kvmrun_icount(b->ia);
     } else {
         wasm_rt_allocate_memory(&b->mem,
                                 wasm2c_botb_min_env_memory,
@@ -1034,8 +1047,7 @@ static void bot_spawn(int dragon, const uint8_t *init, size_t init_len) {
         wasm2c_botb_instantiate(b->ib, &b->env_i, &b->wasi_i, &b->wasix_i);
         b->meter = w2c_botb_wasmer_metering_remaining_points(b->ib);
         b->exh = w2c_botb_wasmer_metering_points_exhausted(b->ib);
-        if (w2c_botb_kvmrun_icount)
-            b->icount = w2c_botb_kvmrun_icount(b->ib);
+        b->icount = w2c_botb_kvmrun_icount(b->ib);
     }
     if (b->icount) b->icount_prev = *b->icount;
 
@@ -1080,9 +1092,17 @@ static uint64_t real_ns(void) {
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 static inline uint64_t rd_tsc(void) {      // profiling: raw cycle counter
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return lo | ((uint64_t)hi << 32);
+#elif defined(__aarch64__)
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+#else
+    return real_ns();                      // profiling fallback (ns)
+#endif
 }
 
 static size_t bot_ask(Bot *b, const uint8_t *block, size_t n, uint8_t *dst) {
@@ -1216,6 +1236,16 @@ static uint64_t entropy64(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return hcall(HC_NOW, 0, 0, 0, 0) ^ ((uint64_t)hi << 32 | lo) * 0x9e3779b97f4a7c15ull;
+#elif defined(_WIN32)
+    uint64_t v = 0;
+    unsigned int lo, hi;
+    if (rand_s(&lo) == 0 && rand_s(&hi) == 0)
+        v = (uint64_t)hi << 32 | lo;
+    if (!v) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        v = (uint64_t)ts.tv_nsec ^ (uint64_t)ts.tv_sec * 0x9e3779b97f4a7c15ull;
+    }
+    return v;
 #else
     uint64_t v = 0;
     FILE *f = fopen("/dev/urandom", "rb");
@@ -1292,9 +1322,9 @@ static int run_match(const uint8_t *map, size_t map_len, uint32_t debug,
             if (G.npts[ti]) stat_line(who, "points", G.pts[ti], G.npts[ti]);
             if (G.nins[ti]) stat_line(who, "insns", G.ins[ti], G.nins[ti]);
         }
-        if (w2c_engine_kvmrun_icount)
-            printf("engine insns total: %.2fM\n",
-                   (double)*w2c_engine_kvmrun_icount(&G.eng) / 1e6);
+        u64 *eic = w2c_engine_kvmrun_icount(&G.eng);
+        if (eic)
+            printf("engine insns total: %.2fM\n", (double)*eic / 1e6);
         if (prof_on) {
             fprintf(stderr, "ask: n=%llu wall=%llums wait=%llums first=%llums wakes=%llu gate=%llums bot=%llums wlast=%llums tail=%llums nw=%llu nr=%llu\n",
                     (unsigned long long)ask_n,

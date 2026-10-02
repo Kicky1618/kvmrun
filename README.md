@@ -101,9 +101,14 @@ unresolved.
 
 ## Requirements
 
-- Linux (tested) or macOS (`native` backend — untested in CI), Python 3.
-  Windows is not supported (`host.c` uses pthreads); use WSL2.
-- `clang`; on Linux also `ld` (guest ELF link for the `kvm` backend)
+- Linux (tested), macOS, or Windows, Python 3. The `native` backend
+  builds on all three; on Windows a mingw/clang-compatible toolchain is
+  required (`host.c` resolves `<pthread.h>`/`<unistd.h>` through the
+  `win32/include` shims) and `runner` links as `runner.exe`.
+  macOS/Windows are compile- and link-verified but not runtime-tested in
+  CI — report issues with `-v` output.
+- `clang` (clang-cl / mingw clang on Windows — MSVC `cl` is not
+  supported); on Linux also `ld` (guest ELF link for the `kvm` backend)
 - [wabt](https://github.com/WebAssembly/wabt) (`wasm2c` with
   `--enable-exceptions`)
 - [simde](https://github.com/simd-everywhere/simde) headers — wasm2c emits

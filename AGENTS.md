@@ -59,7 +59,16 @@
   control reaches it (trap-tail ops are not lost). Metering's injected
   `_check`/`_charge`/`_charge_length` sequences are byte-matched and kept but
   excluded from the count (dropping them silently disables CPU limits — see
-  the `_body` `out += b[k:m]` line; never refactor it away).
+  the `_body` `out += b[k:m]` line; never refactor it away). The host reads
+  the counter through weak *definitions* in `host.c` (NULL stubs overridden
+  by the real exports) — weak undefined references do not link under zig's
+  Mach-O linker, so keep the `KVMRUN_WEAK` definition pattern.
+- `native` backend targets Linux/macOS/Windows: `win32/include` provides
+  `<pthread.h>` (CRITICAL_SECTION/CONDITION_VARIABLE/CreateThread shims)
+  and `<unistd.h>` (`getcwd`); `host.c` uses `rand_s` for seed entropy on
+  `_WIN32` and `rd_tsc` is arch-gated (rdtsc / `cntvct_el0` / `real_ns`).
+  Verified via zig cross-compile: x86_64-windows links `runner.exe`,
+  aarch64-macos links a Mach-O exe. Not runtime-tested off Linux.
 
 ## Verified numbers (i7-12700, apex vs kami, seed 11)
 

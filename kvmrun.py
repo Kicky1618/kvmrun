@@ -51,13 +51,16 @@ def _unswbc_pkg() -> pathlib.Path:
         except OSError:
             pass
     for venv in cands:
-        for sp in sorted(venv.glob("lib/python*/site-packages")):
+        # POSIX venvs: lib/pythonX.Y/site-packages; Windows venvs: Lib/.
+        for sp in sorted(venv.glob("lib/python*/site-packages")) \
+                + sorted(venv.glob("Lib/site-packages")):
             if (sp / "unswbc").is_dir():
                 return sp
-    for sp in sorted(pathlib.Path.home().glob(
-            ".local/share/uv/tools/unswbc/lib/python*/site-packages")):
-        if (sp / "unswbc").is_dir():
-            return sp
+    for pat in (".local/share/uv/tools/unswbc/lib/python*/site-packages",
+                "AppData/Roaming/uv/tools/unswbc/Lib/site-packages"):
+        for sp in sorted(pathlib.Path.home().glob(pat)):
+            if (sp / "unswbc").is_dir():
+                return sp
     raise SystemExit(
         "kvmrun: cannot find the `unswbc` package; install it "
         "(`uv tool install unswbc`) or set UNSWBC_PKG to the site-packages "
@@ -232,6 +235,8 @@ def icount_enabled() -> bool:
 
 
 IS_LINUX = sys.platform.startswith("linux")
+IS_WINDOWS = os.name == "nt"
+EXE = ".exe" if IS_WINDOWS else ""
 
 
 def native_march() -> list[str]:
@@ -242,6 +247,15 @@ def native_march() -> list[str]:
     if m in ("arm64", "aarch64"):
         return ["-mcpu=native"]
     return []
+
+
+def native_flags() -> list[str]:
+    """Extra compile/link flags for host-side objects on this platform."""
+    if IS_WINDOWS:
+        # <pthread.h>/<unistd.h> resolve to the Win32 shims; no -pthread/-lm
+        # (MSVC/clang-cl target has no libm split and no pthread lib).
+        return [f"-I{HERE / 'win32' / 'include'}"]
+    return ["-pthread"]
 
 
 def link_or_copy(link: pathlib.Path, target: pathlib.Path) -> None:
@@ -282,15 +296,20 @@ def guest_cflags() -> list[str]:
 def compile_obj(cdir: pathlib.Path, mod: str, extra_inc: pathlib.Path,
                 guest: bool = False) -> pathlib.Path:
     flags = (guest_cflags() if guest else
-             ["-pthread", "-DWASM_RT_MAX_CALL_STACK_DEPTH=262144"]
+             native_flags() + ["-DWASM_RT_MAX_CALL_STACK_DEPTH=262144"]
              + (SEGUE_FLAGS if host_fsgsbase() else [])
              + os.environ.get("KVMRUN_OBJCFLAGS", "").split())
     if os.environ.get("KVMRUN_PROF"):
         flags += ["-finstrument-functions"]
     opt = os.environ.get("KVMRUN_OPT", "-O2")
+    shim_blob = b""
+    if IS_WINDOWS:
+        for f in sorted((HERE / "win32" / "include").rglob("*")):
+            if f.is_file():
+                shim_blob += f.name.encode() + b"\0" + f.read_bytes()
     tag = hashlib.sha256(tool_versions().encode() +
                          (opt + " " + " ".join(native_march())).encode() +
-                         " ".join(flags).encode() +
+                         " ".join(flags).encode() + shim_blob +
                          (WASM_RT_DIR / "wasm-rt.h").read_bytes() +
                          (WASM_RT_DIR / "wasm-rt-exceptions.h").read_bytes()
                          ).hexdigest()[:10]
@@ -341,6 +360,10 @@ def runner_key(backend: str, link_objs: list[pathlib.Path],
         if f.is_file():
             h.update(f.name.encode() + b"\0" + f.read_bytes())
     h.update(b"host.c\0" + (HERE / "host.c").read_bytes())
+    if IS_WINDOWS:  # pthread/unistd shims affect every host-side object
+        for f in sorted((HERE / "win32" / "include").rglob("*")):
+            if f.is_file():
+                h.update(f.name.encode() + b"\0" + f.read_bytes())
     if backend == "kvm":
         for rel in ("guest/guest.ld", "guest/klibc.c", "guest/gthr.c",
                     "guest/entry.S"):
@@ -429,7 +452,7 @@ def build(backend: str, arg_a: str, arg_b: str):
     else:
         link_objs = objs
     binary = cache_dir("run-" + runner_key(backend, link_objs, same)) / \
-        ("guest.elf" if guest else "runner")
+        ("guest.elf" if guest else "runner" + EXE)
     if binary.is_file():
         print(f"cached runner -> {binary}", file=sys.stderr)
         return binary, vmm_bin() if guest else None
@@ -443,15 +466,16 @@ def build(backend: str, arg_a: str, arg_b: str):
             rt_extra += SEGUE_FLAGS if host_fsgsbase() else []
             for src in RT_SRCS:
                 out = work / (pathlib.Path(src).stem + ".o")
-                sh([CLANG, "-O1", "-pthread", "-c", *rt_extra,
+                sh([CLANG, "-O1", *native_flags(), "-c", *rt_extra,
                     f"-I{WABT_INC}", f"-I{WASM_RT_DIR}",
                     "-o", str(out), str(WASM_RT_DIR / src)])
                 rt_objs.append(out)
             extra = os.environ.get("KVMRUN_CFLAGS", "").split()
-            sh([CLANG, "-O1", "-pthread", *extra, f"-I{WABT_INC}",
+            sh([CLANG, "-O1", *native_flags(), *extra, f"-I{WABT_INC}",
                 f"-I{WASM_RT_DIR}",
                 f"-I{work}", "-o", str(bout), str(HERE / "host.c"),
-                *map(str, objs), *map(str, rt_objs), "-lm"])
+                *map(str, objs), *map(str, rt_objs)]
+               + ([] if IS_WINDOWS else ["-lm"]))
             os.replace(bout, binary)
             print(f"built in {time.monotonic() - t0:.1f}s -> {binary}",
                   file=sys.stderr)
@@ -620,14 +644,10 @@ def main() -> int:
     if backend not in ("native", "kvm"):
         print(f"unknown backend {backend!r}", file=sys.stderr)
         return 2
-    if os.name == "nt":
-        print("kvmrun: Windows is unsupported (host.c needs pthreads); "
-              "use WSL2 or Linux/macOS", file=sys.stderr)
-        return 2
     if backend == "kvm" and not (
             IS_LINUX and os.access("/dev/kvm", os.R_OK | os.W_OK)):
-        print("kvmrun: the kvm backend needs Linux with usable /dev/kvm",
-              file=sys.stderr)
+        print("kvmrun: the kvm backend needs Linux with usable /dev/kvm; "
+              "use --backend native on this platform", file=sys.stderr)
         return 2
 
     if batch_file is not None:

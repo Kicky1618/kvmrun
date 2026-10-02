@@ -18,12 +18,14 @@ import json
 import os
 import pathlib
 import re
-import resource
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+
+if os.name != "nt":
+    import resource
 
 HERE = pathlib.Path(__file__).resolve().parent
 WIN = re.compile(r"(team [AB] wins|draw) after (\d+) rounds .*?\(([\d.]+)s\)")
@@ -61,16 +63,53 @@ _RSS_SNIP = ("import subprocess,resource,sys;"
              "sys.exit(cp.returncode)")
 
 
+def _peak_rss_windows(p) -> int:
+    """PeakWorkingSetSize of a finished child; needs its still-open handle."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [(n, wintypes.DWORD) for n in
+                        ("cb", "PageFaultCount")] + \
+                       [(n, wintypes.c_size_t) for n in
+                        ("PeakWorkingSetSize", "WorkingSetSize",
+                         "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                         "QuotaPeakNonPagedPoolUsage",
+                         "QuotaNonPagedPoolUsage",
+                         "PagefileUsage", "PeakPagefileUsage")]
+
+        pmc = PMC()
+        pmc.cb = ctypes.sizeof(PMC)
+        if ctypes.windll.psapi.GetProcessMemoryInfo(
+                wintypes.HANDLE(p._handle), ctypes.byref(pmc), pmc.cb):
+            return int(pmc.PeakWorkingSetSize)
+    except (AttributeError, OSError):
+        pass
+    return 0
+
+
 def run(cmd, env=None):
+    """returns (CompletedProcess, wall_s, peak_rss_bytes)"""
+    argv = [str(c) for c in cmd]
     t0 = time.monotonic()
+    if os.name == "nt":
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=env)
+        out, err = p.communicate()
+        wall = time.monotonic() - t0
+        rss = _peak_rss_windows(p)
+        return subprocess.CompletedProcess(argv, p.returncode, out, err), \
+            wall, rss
     fd, rssf = tempfile.mkstemp(prefix="kv-rss-")
     os.close(fd)
     try:
-        cp = subprocess.run([sys.executable, "-c", _RSS_SNIP, rssf]
-                            + [str(c) for c in cmd],
+        cp = subprocess.run([sys.executable, "-c", _RSS_SNIP, rssf] + argv,
                             capture_output=True, text=True, env=env)
         wall = time.monotonic() - t0
-        rss = int(pathlib.Path(rssf).read_text() or 0)
+        raw = int(pathlib.Path(rssf).read_text() or 0)
+        # ru_maxrss is KiB on Linux but bytes on macOS
+        rss = raw if sys.platform == "darwin" else raw * 1024
     finally:
         os.unlink(rssf)
     return cp, wall, rss
@@ -86,7 +125,7 @@ def one_match(map_p, a, b, backend, seed, replay=None, env=None):
         "rc": cp.returncode, "wall_s": round(wall, 3),
         "match_s": float(m.group(3)) if m else None,
         "result": f"{m.group(1)} round {m.group(2)}" if m else None,
-        "rss_mb": round(rss / 1024, 1),
+        "rss_mb": round(rss / 2**20, 1),
         "insns": _parse_insns(cp.stdout),
         "stderr_tail": cp.stderr.strip().splitlines()[-40:] if cp.returncode else [],
         "replay": replay,
@@ -100,7 +139,7 @@ def sandbox_run(map_p, a, b, seed, replay):
     return {"rc": cp.returncode, "wall_s": round(wall, 3),
             "match_s": float(m.group(3)) if m else None,
             "result": f"{m.group(1)} round {m.group(2)}" if m else None,
-            "rss_mb": round(rss / 1024, 1), "replay": replay}
+            "rss_mb": round(rss / 2**20, 1), "replay": replay}
 
 
 def med(rs, k):

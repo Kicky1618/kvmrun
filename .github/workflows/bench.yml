@@ -18,9 +18,13 @@ jobs:
 
       - name: Install unswbc + wabt + simde
         run: |
-          # simde headers: wasm2c emits <simde/wasm/simd128.h> for SIMD modules;
-          # the wabt release tarball does not ship them
-          sudo apt-get update -qq && sudo apt-get install -y -qq libsimde-dev
+          # simde headers: wasm2c emits <simde/wasm/simd128.h> for SIMD
+          # modules. Ubuntu's libsimde-dev lacks the wasm/ module, so pull
+          # the upstream source tree instead of the deb.
+          curl -fsSL -o /tmp/simde.tgz \
+            https://github.com/simd-everywhere/simde/archive/refs/tags/v0.8.2.tar.gz
+          sudo tar -xzf /tmp/simde.tgz -C /usr/include \
+            --strip-components=1 simde-0.8.2/simde
           pip install "unswbc==1.2.3"
           curl -fsSL -o /tmp/wabt.tar.gz \
             https://github.com/WebAssembly/wabt/releases/download/1.0.41/wabt-1.0.41-linux-x64.tar.gz

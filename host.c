@@ -1241,9 +1241,7 @@ static const char *g_map_arg;
 
 static uint64_t entropy64(void) {
 #ifdef KVMRUN_GUEST
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return hcall(HC_NOW, 0, 0, 0, 0) ^ ((uint64_t)hi << 32 | lo) * 0x9e3779b97f4a7c15ull;
+    return hcall(HC_NOW, 0, 0, 0, 0) ^ rd_tsc() * 0x9e3779b97f4a7c15ull;
 #elif defined(_WIN32)
     uint64_t v = 0;
     unsigned int lo, hi;

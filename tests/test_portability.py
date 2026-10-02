@@ -32,7 +32,7 @@ print(f"unistd shim covers {sorted(posix_used)}")
 for m in re.finditer(r'__asm__\s+volatile\("rdtsc"', HOST):
     ctx = HOST[:m.start()]
     # nearest preceding 400 chars must contain an arch ifdef
-    assert re.search(r"__x86_64__|__i386__|_M_X64|KVMRUN_GUEST", ctx[-500:]), \
+    assert re.search(r"__x86_64__|__i386__|_M_X64", ctx[-500:]), \
         f"unguarded rdtsc at offset {m.start()}"
 print("rdtsc sites arch-guarded")
 

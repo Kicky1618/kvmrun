@@ -605,7 +605,7 @@ def build(backend: str, arg_a: str, arg_b: str):
             # host `ld` targets PE/COFF (mingw) or Mach-O (Xcode) — drive
             # the ELF link through clang -target + ld.lld instead
             sh([CLANG, "-target", GUEST_TARGET, "-nostdlib",
-                "-fuse-ld=lld",
+                "-fuse-ld=lld", "-static",
                 "-Wl,-T," + str(HERE / "guest" / GUEST_LD),
                 "-Wl,--build-id=none",
                 "-o", str(bout), str(ent), *map(str, gsup), str(ghost),

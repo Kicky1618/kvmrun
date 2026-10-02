@@ -153,7 +153,7 @@ def engine_c() -> pathlib.Path:
         try:
             src = ENGINE_WASM
             blob = ENGINE_WASM.read_bytes()
-            if icount_enabled() and icount.ICOUNT not in blob:
+            if icount_enabled() and not icount.instrumented(blob):
                 src = tmp / "engine.ic.wasm"
                 src.write_bytes(icount.rewrite(blob))
             sh([str(WABT_BIN / "wasm2c"), "-n", "engine", "--enable-exceptions",
@@ -174,7 +174,7 @@ def bot_c(wasm: pathlib.Path, mod: str) -> pathlib.Path:
     if not (d / f"{mod}.c").is_file():
         if metering.REMAINING not in blob:
             blob = metering.instrument(blob)
-        if icount_enabled() and icount.ICOUNT not in blob:
+        if icount_enabled() and not icount.instrumented(blob):
             blob = icount.rewrite(blob)
         tmp = pathlib.Path(tempfile.mkdtemp(prefix=d.name + ".", dir=d.parent))
         try:

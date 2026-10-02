@@ -54,7 +54,9 @@
   that changes the artifact: tool versions, transform sources, flags, runtime
   sources/headers.
 - `KVMRUN_ICOUNT=1` inserts `icount.py` between metering and unatomic:
-  `icount += N` at block boundaries over *original* ops — metering's injected
+  `icount += N` is emitted before every segment boundary — control ops AND
+  every potentially-trapping op (`_SEGMENT_END`) — so an op counts iff
+  control reaches it (trap-tail ops are not lost). Metering's injected
   `_check`/`_charge`/`_charge_length` sequences are byte-matched and kept but
   excluded from the count (dropping them silently disables CPU limits — see
   the `_body` `out += b[k:m]` line; never refactor it away).

@@ -63,6 +63,13 @@ WAT = r"""
     ;; = (block,br_if,i32.const) flush per ENDS_BLOCK + end + rmw ops + end
     ;; block group: block(1) br_if(1:flush w/ i32.const=2 ops..) -> see below
     )
+  ;; trap paths: ops up to and including the trapper must count even
+  ;; though the segment never reaches its end.
+  (func (export "h") (result i32)
+    (drop (i32.div_s (i32.const 7) (i32.const 0)))  ;; traps: +3
+    (i32.const 9))                                 ;; unreached
+  (func (export "v") (param i32) (result i32)
+    (i32.load (local.get 0)))                      ;; OOB traps: +2
 )
 """
 
@@ -178,6 +185,8 @@ def main():
 #include <stdint.h>
 #include <stdio.h>
 #include "wasm-rt.h"
+#include "wasm-rt-exceptions.h"
+#include "wasm-rt-impl.h"
 #include "t.h"
 int main(void) {
     wasm_rt_init();
@@ -185,7 +194,7 @@ int main(void) {
     wasm2c_t_instantiate(&inst);
     uint64_t *ic = w2c_t_kvmrun_icount(&inst);
     uint64_t *rem = w2c_t_wasmer_metering_remaining_points(&inst);
-    uint64_t rem0 = *rem;
+    uint64_t rem0 = *rem, base;
     int fails = 0;
     w2c_t_f(&inst, 5);
     if (*ic != 44) { printf("FAIL f(5): %llu\n", (unsigned long long)*ic); fails++; }
@@ -195,6 +204,16 @@ int main(void) {
     if (*ic != 64) { printf("FAIL f(2): %llu\n", (unsigned long long)*ic); fails++; }
     w2c_t_g(&inst);
     if (*ic != 72) { printf("FAIL g(): %llu\n", (unsigned long long)*ic); fails++; }
+
+    /* trap paths: ops up to & including the trapper still count */
+    base = *ic;
+    if (wasm_rt_impl_try() == 0) { w2c_t_h(&inst); printf("FAIL h: no trap\n"); fails++; }
+    if (*ic - base != 3) { printf("FAIL h trap count: %llu\n",
+                                  (unsigned long long)(*ic - base)); fails++; }
+    base = *ic;
+    if (wasm_rt_impl_try() == 0) { w2c_t_v(&inst, 1u << 28); printf("FAIL v: no trap\n"); fails++; }
+    if (*ic - base != 2) { printf("FAIL v trap count: %llu\n",
+                                  (unsigned long long)(*ic - base)); fails++; }
     printf("icount dynamic: %s (ic=%llu)\n",
            fails ? "FAILURES" : "all pass", (unsigned long long)*ic);
     wasm2c_t_free(&inst);

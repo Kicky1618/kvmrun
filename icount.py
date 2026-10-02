@@ -1,9 +1,11 @@
 """kvmrun-icount: append a dynamic instruction counter to a wasm module.
 
 Adds one exported mutable i64 global `kvmrun_icount` and injects
-`icount += N` at every block boundary (N = ops in that block), using the
-same traversal shape as unswbc.metering so dynamic counts track exactly
-which ops execute, including across loop back-edges and br skip paths.
+`icount += N` before every op that may not fall through (control ops and
+every potentially-trapping op), where N = ops since the previous segment
+boundary. An op is counted iff control reaches it, so counts are exact
+even when a trap aborts a segment mid-way (division by zero, OOB memory
+access, unreachable, ...).
 
 Run AFTER metering.instrument: metering's own injected sequences
 (_check / _charge / _charge_length) are detected and skipped so the count
@@ -43,6 +45,22 @@ def _imported_globals(b: bytes, start: int) -> int:
             total += 1                       # global
             j += 2                           # valtype + mut
     return total
+
+
+def instrumented(blob: bytes) -> bool:
+    """True iff the module already exports a `kvmrun_icount` global."""
+    for sid, j, end, _ in sections(blob):
+        if sid != 7:
+            continue
+        n, j = uleb(blob, j)
+        for _ in range(n):
+            ln, j = uleb(blob, j)
+            name = blob[j:j + ln]; j += ln
+            kind = blob[j]; j += 1
+            _, j = uleb(blob, j)
+            if kind == 3 and name == ICOUNT:
+                return True
+    return False
 
 
 def _find_metering_globals(b: bytes, found) -> tuple[int, int]:
@@ -126,6 +144,36 @@ def _charge(ic: int, n: int) -> bytes:
         + put_uleb(ic)
 
 
+# Segment boundaries = ops that may not fall through. ENDS_BLOCK covers the
+# control ops; the rest are ops that can trap. The trapper itself is counted
+# (its charge runs before it does).
+_SEGMENT_END = frozenset(ENDS_BLOCK) | {
+    0x00,                                   # unreachable
+    0x25, 0x26,                             # table.get / table.set (OOB)
+    *range(0x28, 0x3F),                     # scalar loads/stores (OOB)
+    0x6D, 0x6E, 0x6F, 0x70,                 # i32 div/rem
+    0x7F, 0x80, 0x81, 0x82,                 # i64 div/rem
+    0xA8, 0xA9, 0xAA, 0xAB,                 # i32.trunc_f{32,64}_{s,u}
+    0xAE, 0xAF, 0xB0, 0xB1,                 # i64.trunc_f{32,64}_{s,u}
+}
+# prefixed subs taking a memory operand (all OOB-trappable):
+#   0xFC: memory.init/copy/fill, table.init/copy/fill
+#   0xFD: v128 load/store family + lane loads/stores
+#   0xFE: notify/wait + all RMW ops
+_FC_TRAP = {8, 10, 11, 12, 14, 17}
+_FD_TRAP = set(range(0, 12)) | set(range(84, 92)) | {92, 93}
+_FE_TRAP = {0, 1, 2} | set(range(0x10, 0x4F))
+_TRAP_PREFIX = {0xFC: _FC_TRAP, 0xFD: _FD_TRAP, 0xFE: _FE_TRAP}
+
+
+def _is_segment_end(code: int) -> bool:
+    if code in _SEGMENT_END:
+        return True
+    if code > 0xFFFF:
+        return code & 0xFFFF in _TRAP_PREFIX.get(code >> 16, ())
+    return False
+
+
 def _body(b: bytes, start: int, end: int, ic: int,
           rem: int, exh: int) -> bytes:
     k = start
@@ -144,7 +192,7 @@ def _body(b: bytes, start: int, end: int, ic: int,
         op = k
         code, k = next_op(b, k)
         acc += 1
-        if code in ENDS_BLOCK and acc:
+        if _is_segment_end(code) and acc:
             out += _charge(ic, acc)
             acc = 0
         out += b[op:k]
@@ -152,6 +200,8 @@ def _body(b: bytes, start: int, end: int, ic: int,
 
 
 def rewrite(blob: bytes) -> bytes:
+    if instrumented(blob):
+        return blob
     found: dict[int, tuple[int, int]] = {}
     for sid, j, end, _ in sections(blob):
         found.setdefault(sid, (j, end))

@@ -132,11 +132,16 @@ unresolved.
 ### Instruction counts
 
 `KVMRUN_ICOUNT=1` runs `icount.py` between metering and unatomic: it
-appends one exported `i64` global and emits `icount += N` at every block
-boundary, where N is the number of original module ops in that block.
-Metering's own injected sequences (`_check`/`_charge`/`_charge_length`)
-are recognized and excluded, so counts cover the module's real ops only —
-the official weighted CPU-point accounting is untouched.
+appends one exported `i64` global and emits `icount += N` before every op
+that may not fall through — control ops (`br*`/`call*`/`return`/`throw`/…)
+plus every op that can trap (`unreachable`, integer div/rem, float→int
+truncations, all loads/stores, table ops, bulk memory ops, atomics).
+An op is therefore counted iff control reaches it: counts stay exact even
+when a trap aborts a segment mid-way, and ops that are never reached are
+never counted. Metering's own injected sequences
+(`_check`/`_charge`/`_charge_length`) are recognized and excluded, so
+counts cover the module's real ops only — the official weighted CPU-point
+accounting is untouched.
 
 ```
 team A insns per turn: p50 5.4M  p99 19.9M  mean 5.9M  max 23.2M  (131 turns)

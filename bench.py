@@ -184,7 +184,24 @@ def main() -> int:
     print(json.dumps(out, indent=1))
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(out, indent=1))
-    return 0
+
+    fails = []
+    for be, ent in out["backends"].items():
+        for r in ent.get("runs", []):
+            if r["rc"] != 0 or r["result"] is None:
+                fails.append(f"{be} rc={r['rc']} result={r['result']}")
+        cb = ent.get("cold_build")
+        if cb and (cb["rc"] != 0 or cb["result"] is None):
+            fails.append(f"{be} cold_build rc={cb['rc']}")
+    for r in out.get("sandbox", {}).get("runs", []):
+        if r["rc"] != 0 or r["result"] is None:
+            fails.append(f"sandbox rc={r['rc']} result={r['result']}")
+    for seed, c in out.get("replay_compare", {}).items():
+        if c["identical"] is not True:
+            fails.append(f"replay_compare seed={seed} identical={c['identical']}")
+    for f in fails:
+        print(f"FAIL: {f}", file=sys.stderr)
+    return 1 if fails else 0
 
 
 if __name__ == "__main__":

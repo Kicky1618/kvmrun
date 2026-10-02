@@ -65,7 +65,7 @@ def one_match(map_p, a, b, backend, seed, replay=None, env=None):
         "match_s": float(m.group(3)) if m else None,
         "result": f"{m.group(1)} round {m.group(2)}" if m else None,
         "rss_mb": round(rss / 1024, 1),
-        "stderr_tail": cp.stderr.strip().splitlines()[-3:] if cp.returncode else [],
+        "stderr_tail": cp.stderr.strip().splitlines()[-40:] if cp.returncode else [],
         "replay": replay,
     }
 

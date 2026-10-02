@@ -43,6 +43,26 @@ Every stage is content-addressed under `~/.cache/kvmrun/` (respects
 `XDG_CACHE_HOME`), so rebuilt bots only recompile what changed and repeated
 match runs start instantly.
 
+## Benchmarks
+
+Measured on a 12th-gen i7-12700 (20 threads), `apex` vs `kami`, seed 11,
+identical match outcomes verified across all three runs. Times are the
+engine-reported match duration; bot wasm builds were already cached for both
+tools (kvmrun's first build adds ~12 s).
+
+| map | match length | `unswbc run --sandbox` | kvmrun `native` | kvmrun `kvm` |
+|---|---|---|---|---|
+| `arena.map` | 44 rounds | 16.8 s | **0.6 s** (~28×) | **0.3 s** (~56×) |
+| `schooltime.map` | 179 rounds, 7,115 turns | ~20–30 min (projected) | **~22 s** (~60–80×) | **~24 s** (~50–75×) |
+
+The schooltime sandbox run was killed at round 51/179 after ~6 minutes
+(~5–8 s/round and growing with the dragon count); its own pace implies
+~20–30 minutes to elimination.
+
+Note that `kvm` can be *slower* than `native` on long matches — that is the
+point: one vCPU serialises all bot threads, mirroring the judge's CPU-point
+contention model instead of spreading bots across host cores.
+
 ## Requirements
 
 - Linux, Python 3

@@ -5,7 +5,8 @@
 - Single match: `python3 kvmrun.py MAP BOT_A BOT_B --backend native|kvm --seed N --replay OUT`
 - Needs `unswbc` 1.2.3 (uv tool) and wabt (`wasm2c`); override discovery with
   `UNSWBC_PKG`, `WABT_BIN`/`WABT`. `KVMRUN_OPT` changes generated-code opt
-  level (default `-O2`; `-O3` measured slower — do not flip back blindly).
+  level (default `-O2`; `-O3` measured ~5% faster on schooltime seed 11 —
+  earlier data said slower, so keep it opt-in until A/B'd per workload).
 - Tests:
   - `python3 tests/test_unatomic.py` — wat→lower→validate→wasm2c→run
     differential for every atomic op shape (needs wabt).

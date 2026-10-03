@@ -73,20 +73,31 @@ match runs start instantly.
 
 ## Benchmarks
 
-Measured on a 12th-gen i7-12700 (20 threads), `apex` vs `kami`, official maps
-only. Times are the engine-reported match duration with warm build caches
-(kvmrun's first build adds ~10–15 s). Replays verified **byte-identical**
-across `native`, `kvm`, and — where run to completion — `--sandbox`.
+Measured on a 12th-gen i7-12700 (20 threads), `kami` vs `apex-v48`, official
+maps only, metered matches with replay writing enabled. Times are
+engine-reported match durations over 2–3 runs per seed (median), warm build
+caches. Replays verified **byte-identical** across `native`, `kvm`, and —
+where run to completion — `--sandbox`, on every seed shown.
 
-| map | match length | `unswbc run --sandbox` | kvmrun `native` | kvmrun `kvm` |
-|---|---|---|---|---|
-| `arena.map` | 44 rounds | 16.8 s | **0.55 s** (~31×) | **0.3 s** (~56×) |
-| `schooltime.map` | 179 rounds, 7,115 turns | ~20–30 min (projected) | **16.0 s** (~75–110×) | **16.2 s** (~74–110×) |
-| `help.map` | 500 rounds, ~62k turns | not measured (hours) | **171.6 s** | **~172 s** |
+The host was under ordinary desktop load (~4–6 busy cores of background
+apps); run-to-run spread on `help.map` reached ~30 %, so treat absolute
+times as ±15 % and lean on the sandbox-vs-kvmrun ratio measured in the
+same session.
 
-Reproduce: `python3 bench.py MAP BOT_A BOT_B --seeds 11 --runs N --backends
-native,kvm --compare` — always compare on the same explicit seed set and run
-serially (concurrent jobs skew both timing and the per-run peak-RSS sample).
+| map | match length | `unswbc run --sandbox` | kvmrun `native` | kvmrun `kvm` | replay parity |
+|---|---|---|---|---|---|
+| `arena.map` | 44–46 rounds | 30.9–31.1 s wall | **0.6–0.8 s** (~40–50×) | **0.5–0.8 s** (~40–60×) | identical (seeds 11, 22) |
+| `schooltime.map` | 155 rounds, 6,574 turns | ~20–30 min (projected) | **18.4 s** (~65–100×) | **19.7–25.4 s** | identical (seeds 11, 22) |
+| `help.map` | 500 rounds, ~62k turns | not measured (hours) | **373–429 s** | **454–608 s** | identical (seed 11) |
+
+Work done per `schooltime` match (exact `kvmrun_icount` instrumentation):
+~107 G executed wasm ops — team A 9.7 G (797 turns), team B 96 G (5,777
+turns), engine 1.3 G — ≈ 6 Gwasmops/s sustained on this host.
+
+Reproduce: `python3 bench.py MAP BOT_A BOT_B --seeds 11,22 --runs 3
+--backends native,kvm --sandbox --compare` — always compare on the same
+explicit seed set and run serially (concurrent jobs skew both timing and
+the per-run peak-RSS sample).
 
 The schooltime sandbox run was killed at round 51/179 after ~6 minutes
 (~5–8 s/round and growing with the dragon count); its own pace implies
@@ -121,10 +132,19 @@ unresolved.
   `gctx_switch` saves/restores it, and the VMM sets guest CR4.FSGSBASE only
   when CPUID leaf 7 advertises it. On a loaded box `schooltime.map` in-guest
   time measured 56.9 s → 47.8 s (indicative, not a clean benchmark).
-- Wall time on `help.map` (seed 11): native ~172–187 s, kvm ~172–181 s
-  across runs vs a ~175 s same-session baseline — parity within machine
-  noise. `-O3` was measured *slower* than `-O2` on generated code and is
-  not used.
+- **binaryen `wasm-opt` pass** — when a ≥ 133 `wasm-opt` is on `PATH`, the
+  metered module is optimised before lowering: ~18–22 % fewer static ops
+  (`bota` 328k → 256k, `botb` 624k → 513k), end-to-end gains of roughly
+  1.1–1.25× on this workload. Replays stay byte-identical; the pass is a
+  no-op without the tool (`KVMRUN_NO_WASMOPT=1` to force off).
+- **Parallel TU shards** — generated C is split across `--num-outputs`
+  shards compiled concurrently: cold-cache two-bot builds dropped ~30 %
+  (~60 s → ~42 s on this host). On a fully cold cache, `unswbc`'s own
+  judge-clang bot builds dominate the first match (~110 s total here).
+- Wall time on `help.map` (seed 11): see the table above — the earlier
+  ~172 s figure was measured on a quieter host; today's loaded-host
+  medians are ~400 s native / ~530 s kvm. `-O3` now measures ~5 % ahead
+  of `-O2` on generated code (`KVMRUN_OPT=-O3` to try it).
 - Security hardening and test coverage are documented in `SECURITY.md`.
 
 ## Requirements

@@ -109,10 +109,21 @@
   via the `SAME_BOT_SHIM` header macros — every `w2c_botb_*` reference in
   `host.c`, including function *definitions*, must stay `#ifndef`-guarded
   so macro expansion cannot produce a duplicate definition.
-- `wasm2c` flags are probed (`wasm2c_flags`): `--enable-exceptions` was
-  removed in newer wabt (exceptions always on) — never pass it blindly.
+- `wasm2c` flags are probed (`wasm2c_flags`/`_w2c_help`): `--enable-exceptions`
+  was removed in newer wabt (exceptions always on) — never pass it blindly.
   `simde_flags()` probes SIMDE_INC/homebrew/macports prefixes for
   `simde/wasm/simd128.h`; unswbc requires Python ≥ 3.11 or `tomli`.
+- Optional passes between metering and unatomic: `wasm-opt -O3` when a
+  binaryen ≥ 133 `wasm-opt` is found (`WASM_OPT` overrides the path,
+  `KVMRUN_NO_WASMOPT=1` disables; < 133 misparse the new-EH encoding and
+  abort, parse failures fall back to the unoptimized module) — charge
+  constants are already baked, so replays stay byte-identical.
+- `KVMRUN_SPLIT` (default `min(8, ncpu)`, `1` disables) feeds
+  `--num-outputs` to wasm2c: the generated C lands in per-shard TUs
+  (`{mod}_{i}.c` + `{mod}-impl.h`) that `compile_obj` builds in parallel
+  (~30% faster cold builds, replay-identical). Shard functions are extern,
+  so cross-TU inlining is lost; `KVMRUN_OBJCFLAGS=-flto=thin` +
+  `KVMRUN_CFLAGS="-flto=thin -fuse-ld=lld"` recovers it at link time.
 
 ## Verified numbers (i7-12700, apex vs kami, seed 11)
 

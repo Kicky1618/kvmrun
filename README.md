@@ -48,11 +48,19 @@ For each bot (`.wasm` file or source directory):
 ```
 source dir --(unswbc clangtool)--> bot.wasm
 bot.wasm --(metering, if absent)--> metered.wasm
-metered.wasm --(unatomic.py)--> lowered.wasm   # threads/atomics -> single-threaded
+metered.wasm --(wasm-opt -O3, if binaryen>=133)--> opt.wasm   # optional
+opt.wasm --(unatomic.py)--> lowered.wasm   # threads/atomics -> single-threaded
 lowered.wasm --(wasm2c -n bota|botb --enable-exceptions)--> bot.c/.h
 bot.c --(clang -O2 -march=native / -mcpu=native on arm64)--> bot.o
 engine.wasm --(wasm2c -n engine)--> engine.c --(clang)--> engine.o
 ```
+
+wasm2c can also emit several translation units (`--num-outputs`,
+default `min(8, ncpu)` — set `KVMRUN_SPLIT=1` for a single TU): the
+shards compile in parallel, which cuts cold-cache build time by ~30%.
+Split shards become extern symbols, so cross-TU inlining is lost;
+`KVMRUN_OBJCFLAGS=-flto=thin KVMRUN_CFLAGS="-flto=thin -fuse-ld=lld"`
+restores it at link time (replays remain byte-identical).
 
 `host.c` then runs a judge-faithful match: pipes for stdin/stdout,
 ENDTURN/stdin-park/exit semantics, 10 s wall clock per turn, CPU-point metering
@@ -165,6 +173,9 @@ unresolved.
 | `SIMDE_INC` | extra include dir probed for `simde/wasm/simd128.h` (before the built-in list) |
 | `XDG_CACHE_HOME` | cache root (default `~/.cache`) |
 | `KVMRUN_OPT` | optimization level for generated objects (default `-O2`) |
+| `KVMRUN_SPLIT` | TU shard count for generated C (`--num-outputs`); default `min(8, ncpu)`, `1` disables |
+| `KVMRUN_NO_WASMOPT` | `1` skips the optional binaryen `wasm-opt -O3` pass |
+| `WASM_OPT` | path to a `wasm-opt` binary (else `PATH` lookup; requires version ≥ 133) |
 | `KVMRUN_DEPTHCOUNT` | `0` disables wasm call-depth counting |
 | `KVMRUN_PROF` | build guest objects with `-finstrument-functions` |
 | `KVMRUN_ICOUNT` | `1` instruments every module with a `kvmrun_icount` global — per-turn and total raw wasm instruction counts are printed after the match and parsed by `bench.py --icount` |

@@ -143,6 +143,21 @@ def wasm_opt() -> list[str] | None:
     return _WASM_OPT or None
 
 
+_W2C_HELP: list[str] | None = None
+
+
+def _w2c_help() -> list[str]:
+    global _W2C_HELP
+    if _W2C_HELP is None:
+        try:
+            out = subprocess.run([str(WABT_BIN / "wasm2c"), "--help"],
+                                 capture_output=True, text=True)
+            _W2C_HELP = (out.stdout + out.stderr).split()
+        except OSError:
+            _W2C_HELP = []
+    return _W2C_HELP
+
+
 _W2C_FLAGS: list[str] | None = None
 
 
@@ -151,15 +166,21 @@ def wasm2c_flags() -> list[str]:
     (exceptions are always on) around 1.0.36 — pass it only if advertised."""
     global _W2C_FLAGS
     if _W2C_FLAGS is None:
-        try:
-            out = subprocess.run([str(WABT_BIN / "wasm2c"), "--help"],
-                                 capture_output=True, text=True)
-            _W2C_FLAGS = (["--enable-exceptions"]
-                          if "--enable-exceptions" in
-                          (out.stdout + out.stderr) else [])
-        except OSError:
-            _W2C_FLAGS = []
+        _W2C_FLAGS = (["--enable-exceptions"]
+                      if "--enable-exceptions" in _w2c_help() else [])
     return _W2C_FLAGS
+
+
+def split_outputs() -> int:
+    """TU shard count for generated bot/engine C files. --num-outputs
+    splits wasm2c output into per-function-group TUs that compile in
+    parallel (big win on cold-cache builds for large bots).
+    KVMRUN_SPLIT=1 restores the single-TU pipeline."""
+    raw = os.environ.get("KVMRUN_SPLIT")
+    n = int(raw) if raw else min(8, os.cpu_count() or 1)
+    if n > 1 and any(t.startswith("--num-outputs") for t in _w2c_help()):
+        return n
+    return 1
 
 
 _SIMDE_INC: str | None = None
@@ -199,6 +220,7 @@ def tool_versions() -> str:
         wo = wasm_opt()
         _TOOLVERS = (f"{wv}|{cv}|{src}|ic={os.environ.get('KVMRUN_ICOUNT', '')}"
                      f"|w2c={' '.join(wasm2c_flags())}"
+                     f"|split={split_outputs()}"
                      f"|wo={' '.join(wo) if wo else ''}")
     return _TOOLVERS
 
@@ -231,11 +253,19 @@ def bot_wasm(arg: str) -> pathlib.Path:
     raise SystemExit(f"{arg}: not a .wasm file or source directory")
 
 
+def c_outputs(mod: str) -> list[str]:
+    """Files a {mod} module's wasm2c run produces beyond {mod}.h."""
+    n = split_outputs()
+    if n > 1:
+        return [f"{mod}-impl.h"] + [f"{mod}_{i}.c" for i in range(n)]
+    return [f"{mod}.c"]
+
+
 def engine_c() -> pathlib.Path:
     key = "engine-" + hashlib.sha256(
         ENGINE_WASM.read_bytes() + tool_versions().encode()).hexdigest()[:24]
     d = cache_dir(key)
-    if not (d / "engine.c").is_file():
+    if not (d / c_outputs("engine")[-1]).is_file():
         tmp = pathlib.Path(tempfile.mkdtemp(prefix=d.name + ".", dir=d.parent))
         try:
             src = ENGINE_WASM
@@ -243,10 +273,13 @@ def engine_c() -> pathlib.Path:
             if icount_enabled() and not icount.instrumented(blob):
                 src = tmp / "engine.ic.wasm"
                 src.write_bytes(icount.rewrite(blob))
+            n = split_outputs()
             sh([str(WABT_BIN / "wasm2c"), "-n", "engine", *wasm2c_flags(),
+                *(["--num-outputs", str(n)] if n > 1 else []),
                 "-o", str(tmp / "engine.c"), str(src)])
-            os.replace(tmp / "engine.h", d / "engine.h")
-            os.replace(tmp / "engine.c", d / "engine.c")
+            # last file lands last: its presence implies the rest landed
+            for f in ["engine.h", *c_outputs("engine")]:
+                os.replace(tmp / f, d / f)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     return d
@@ -258,7 +291,7 @@ def bot_c(wasm: pathlib.Path, mod: str) -> pathlib.Path:
     key = f"{mod}-" + hashlib.sha256(
         blob + tool_versions().encode()).hexdigest()[:24]
     d = cache_dir(key)
-    if not (d / f"{mod}.c").is_file():
+    if not (d / c_outputs(mod)[-1]).is_file():
         if metering.REMAINING not in blob:
             blob = metering.instrument(blob)
         tmp = pathlib.Path(tempfile.mkdtemp(prefix=d.name + ".", dir=d.parent))
@@ -277,10 +310,12 @@ def bot_c(wasm: pathlib.Path, mod: str) -> pathlib.Path:
                 blob = icount.rewrite(blob)
             lowered = tmp / f"{mod}.lowered.wasm"
             lowered.write_bytes(unatomic.rewrite(blob))
+            n = split_outputs()
             sh([str(WABT_BIN / "wasm2c"), "-n", mod, *wasm2c_flags(),
+                *(["--num-outputs", str(n)] if n > 1 else []),
                 "-o", str(tmp / f"{mod}.c"), str(lowered)])
             # .c last: its presence implies .h and .lowered.wasm landed
-            for f in (f"{mod}.h", f"{mod}.lowered.wasm", f"{mod}.c"):
+            for f in (f"{mod}.h", f"{mod}.lowered.wasm", *c_outputs(mod)):
                 os.replace(tmp / f, d / f)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -403,7 +438,7 @@ def guest_cflags() -> list[str]:
 
 
 def compile_obj(cdir: pathlib.Path, mod: str, extra_inc: pathlib.Path,
-                guest: bool = False) -> pathlib.Path:
+                guest: bool = False) -> list[pathlib.Path]:
     flags = (guest_cflags() if guest else
              native_flags() + ["-DWASM_RT_MAX_CALL_STACK_DEPTH=262144"]
              + (SEGUE_FLAGS if host_fsgsbase() else [])
@@ -422,18 +457,27 @@ def compile_obj(cdir: pathlib.Path, mod: str, extra_inc: pathlib.Path,
                          (WASM_RT_DIR / "wasm-rt.h").read_bytes() +
                          (WASM_RT_DIR / "wasm-rt-exceptions.h").read_bytes()
                          ).hexdigest()[:10]
-    obj = cdir / f"{mod}.{tag}.o"
-    if not obj.is_file():
-        tmp = _tmp_for(obj)
-        try:
-            sh([CLANG, opt, *native_march(), "-c", *flags, f"-I{WABT_INC}",
-                f"-I{WASM_RT_DIR}",
-                f"-I{cdir}", f"-I{extra_inc}", "-o", str(tmp),
-                str(cdir / f"{mod}.c")])
-            os.replace(tmp, obj)
-        finally:
-            tmp.unlink(missing_ok=True)
-    return obj
+    shards = [f for f in c_outputs(mod) if f.endswith(".c")]
+
+    def one(src: str) -> pathlib.Path:
+        obj = cdir / f"{src[:-2]}.{tag}.o"
+        if not obj.is_file():
+            tmp = _tmp_for(obj)
+            try:
+                sh([CLANG, opt, *native_march(), "-c", *flags, f"-I{WABT_INC}",
+                    f"-I{WASM_RT_DIR}",
+                    f"-I{cdir}", f"-I{extra_inc}", "-o", str(tmp),
+                    str(cdir / src)])
+                os.replace(tmp, obj)
+            finally:
+                tmp.unlink(missing_ok=True)
+        return obj
+
+    if len(shards) == 1:
+        return [one(shards[0])]
+    # split TUs compile independently — run them on idle cores
+    with concurrent.futures.ThreadPoolExecutor(len(shards)) as ex:
+        return list(ex.map(one, shards))
 
 
 SAME_BOT_SHIM = """\
@@ -556,7 +600,7 @@ def build(backend: str, arg_a: str, arg_b: str):
         return compile_obj(d, mod, work, guest=backend == "kvm")
 
     guest = backend == "kvm"
-    objs = [] if guest else [compile_obj(eng_dir, "engine", work)]
+    objs = [] if guest else compile_obj(eng_dir, "engine", work)
     link_or_copy(work / "engine.h", eng_dir / "engine.h")
 
     ths = []
@@ -564,7 +608,7 @@ def build(backend: str, arg_a: str, arg_b: str):
     a_obj: list[pathlib.Path] = []
     def _a():
         try:
-            a_obj.append(stage("bota", wa))
+            a_obj.extend(stage("bota", wa))
         except BaseException as e:
             errs.append(e)
     t = threading.Thread(target=_a); t.start(); ths.append(t)
@@ -572,7 +616,7 @@ def build(backend: str, arg_a: str, arg_b: str):
         b_obj: list[pathlib.Path] = []
         def _b():
             try:
-                b_obj.append(stage("botb", wb))
+                b_obj.extend(stage("botb", wb))
             except BaseException as e:
                 errs.append(e)
         t = threading.Thread(target=_b); t.start(); ths.append(t)
@@ -591,7 +635,7 @@ def build(backend: str, arg_a: str, arg_b: str):
     # (backend, engine, bota, botb|shim, support sources, flags)
     if guest:
         eng_gobj = compile_obj(eng_dir, "engine", work, guest=True)
-        link_objs = [eng_gobj] + objs
+        link_objs = eng_gobj + objs
     else:
         link_objs = objs
     binary = cache_dir("run-" + runner_key(backend, link_objs, same)) / \
